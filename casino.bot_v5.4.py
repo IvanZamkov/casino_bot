@@ -1713,7 +1713,7 @@ def calc_delta_1x3(codes: List[int], stake_cents: int) -> int:
     sevens = codes.count(4)
     if sevens > 0:
         if sevens == 1:
-            return -1 * stake
+            return +1 * stake
         if sevens == 2:
             return +2 * stake
         return +3 * stake
@@ -1721,7 +1721,7 @@ def calc_delta_1x3(codes: List[int], stake_cents: int) -> int:
     demons = codes.count(5)
     if demons > 0:
         if demons == 1:
-            return -1 * stake
+            return +1 * stake
         if demons == 2:
             return +4 * stake
         return +5 * stake
