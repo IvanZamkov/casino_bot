@@ -23,7 +23,7 @@ from telebot.types import (
 # CONFIG
 OWNER_ID = int(os.environ.get("OWNER_ID", "7739179390"))
 MAX_LIFE_STAKES = 3  # сколько раз можно поставить жизнь
-BOT_TOKEN = "8524213683:AAEfwHyyfiiJUkZoUHxVis62brF6C_vWFKo"
+BOT_TOKEN = "8524213683:AAHO9OJ4sFVzcEJWJEQHm6tUq99psWE0suU"
 
 bot = TeleBot(BOT_TOKEN, threaded=True, num_threads=8)
 
