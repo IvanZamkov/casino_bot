@@ -4376,22 +4376,22 @@ def on_spin_pull(call: CallbackQuery):
     _, _, game_id = base.split(":", 2)
     uid = owner
 
-    srow = db_one("SELECT stage, msg_chat_id, msg_id, inline_id FROM spins WHERE game_id=? AND user_id=?", (game_id, uid))
+    srow = db_one("SELECT COALESCE (stage, 'ready'), msg_chat_id, msg_id, inline_id FROM spins WHERE game_id=? AND user_id=?", (game_id, uid))
     if not srow:
         bot.answer_callback_query(call.id, "Этот ход не активен.", show_alert=True)
         return
     stage, msg_chat_id, msg_id, inline_id = srow
     if stage != "ready":
-        db_exec("UPDATE spins SET stage='spinning' WHERE game_id=? AND user_id=?", (game_id, uid), commit=True)
         bot.answer_callback_query(call.id, "Рулетка уже крутится. Бот прогружает её. Подождите.", show_alert=True)
         return
+    
+    db_exec("UPDATE spins SET stage='spinning' WHERE game_id=? AND user_id=?", (game_id, uid), commit=True)
     
     def _edit(text: str, kb=None):
         if inline_id:
             limited_edit_message_text(text=text, inline_id=inline_id, reply_markup=kb, parse_mode="HTML")
         else:
             limited_edit_message_text(text=text, chat_id=msg_chat_id, msg_id=msg_id, reply_markup=kb, parse_mode="HTML")
-
 
     def run_spin():
         try:
