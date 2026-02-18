@@ -457,6 +457,29 @@ CREATE TABLE IF NOT EXISTS buy_offer_resp (
 """)
 
 cur.execute("""
+CREATE TABLE IF NOT EXISTS buyrab_offers (
+  offer_id TEXT PRIMARY KEY,
+  tx_no INTEGER,
+  slave_id INTEGER,
+  buyer_id INTEGER,
+  total_cents INTEGER,
+  hold_cents INTEGER DEFAULT 0,
+  created_ts INTEGER,
+  state INTEGER DEFAULT 0        -- 0 draft, 1 pending, 2 done, -1 cancelled
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS buyrab_offer_resp (
+  offer_id TEXT,
+  owner_id INTEGER,
+  pay_cents INTEGER DEFAULT 0,
+  status INTEGER DEFAULT 0,      -- 0 pending, 1 accepted, -1 declined
+  PRIMARY KEY (offer_id, owner_id)
+)
+""")
+
+cur.execute("""
 CREATE TABLE IF NOT EXISTS work_stats (
   user_id INTEGER,
   job_key TEXT,
@@ -773,6 +796,40 @@ def safe_format(template: str, **kwargs) -> str:
 # Credit helpers
 CREDIT_INTERVAL_SEC = 2 * 24 * 3600
 CREDIT_NOTICE_GRACE_SEC = 12 * 3600
+# Credit limits
+CREDIT_MIN_DOLLARS = 1_000
+CREDIT_BASE_MAX_DOLLARS = 1_000_000
+CREDIT_MAX_STEP_WINS = 10
+CREDIT_MAX_STEP_DOLLARS = 1_000_000
+
+def credit_limits_cents(uid: int) -> Tuple[int, int, int]:
+    """
+    Возвращает (min_cents, max_cents, wins).
+    max растёт на +1_000_000$ за каждые 10 побед.
+    """
+    try:
+        _games_total, wins, *_ = get_game_stats(int(uid))
+    except Exception:
+        wins = 0
+    wins = int(wins or 0)
+
+    step = wins // CREDIT_MAX_STEP_WINS
+    max_dollars = CREDIT_BASE_MAX_DOLLARS + step * CREDIT_MAX_STEP_DOLLARS
+
+    return CREDIT_MIN_DOLLARS * 100, int(max_dollars) * 100, wins
+
+def credit_amount_ok(uid: int, sum_cents: int) -> Tuple[bool, str]:
+    min_c, max_c, wins = credit_limits_cents(uid)
+    sum_cents = int(sum_cents or 0)
+
+    if sum_cents < min_c or sum_cents > max_c:
+        msg = (
+            f"Превышен лимит суммы кредита: минимум {cents_to_money_str(min_c)}$, максимум {cents_to_money_str(max_c)}$.\n"
+            f"Примечание: Лимит растёт каждые {CREDIT_MAX_STEP_WINS} побед в играх (+{CREDIT_MAX_STEP_DOLLARS}$ к максимуму), ваше колличество побед на данный момент: {wins}."
+        )
+        return False, msg
+
+    return True, ""
 
 def credit_total_payable_cents(principal_cents: int, rate_pct: int) -> int:
     """principal + interest, округление вверх до цента."""
@@ -1327,8 +1384,8 @@ SHOP_ITEMS = {
 }
 
 # SHOP: dynamic pricing (balance-based)
-SHOP_PRICE_STEP_CENTS = 5000_00  # each full $5000 on balance increases price
-SHOP_PRICE_STEP_ADD_PCT = 50     # +50% of base price per step
+SHOP_PRICE_STEP_CENTS = 5000_00  # each full $ on balance increases price
+SHOP_PRICE_STEP_ADD_PCT = 100     # +% of base price per step
 
 def shop_price_steps_for_balance(balance_cents: int) -> int:
     try:
@@ -1728,8 +1785,8 @@ def shop_item_kb(uid: int, key: str) -> InlineKeyboardMarkup:
     return kb
 
 # Шанс раба для Страховки и Пакета
-SLAVE_RISK_BASE_PCT = 10 #начальный %
-SLAVE_RISK_STEP_PCT = 5 #добавочный % после каждого использования
+SLAVE_RISK_BASE_PCT = 15 #начальный %
+SLAVE_RISK_STEP_PCT = 10 #добавочный % после каждого использования
 
 def slave_risk_get_pct(uid: int) -> int:
     row = db_one("SELECT chance_pct FROM enslave_risk WHERE user_id=?", (int(uid),))
@@ -2635,6 +2692,14 @@ def on_credit(call: CallbackQuery):
         sum_cents = int(parts[2])
         term_days = int(parts[3])
 
+        ok, msg = credit_amount_ok(uid, sum_cents)
+        if not ok:
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("Назад в профиль", callback_data=cb_pack("profile:open", uid)))
+            edit_inline_or_message(call, f"<b>Ошибка:</b> {html_escape(msg)}", reply_markup=kb, parse_mode="HTML")
+            bot.answer_callback_query(call.id)
+            return
+
         rates = []
         if term_days == 30:
             rates = [15, 20]
@@ -2663,6 +2728,14 @@ def on_credit(call: CallbackQuery):
         sum_cents = int(parts[2])
         term_days = int(parts[3])
         rate = int(parts[4])
+
+        ok, msg = credit_amount_ok(uid, sum_cents)
+        if not ok:
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("Назад в профиль", callback_data=cb_pack("profile:open", uid)))
+            edit_inline_or_message(call, f"<b>Ошибка:</b> {html_escape(msg)}", reply_markup=kb, parse_mode="HTML")
+            bot.answer_callback_query(call.id)
+            return
 
         code_num = random.randint(1000000, 9999999)
         me = get_user(uid)
@@ -2698,6 +2771,11 @@ def on_credit(call: CallbackQuery):
         rate = int(parts[4])
         code_num = int(parts[5])
 
+        ok, msg = credit_amount_ok(uid, sum_cents)
+        if not ok:
+            bot.answer_callback_query(call.id, msg, show_alert=True)
+            return
+
         if credit_has_active(uid):
             bot.answer_callback_query(call.id, "У вас уже есть активный кредит.", show_alert=True)
             return
@@ -2712,7 +2790,7 @@ def on_credit(call: CallbackQuery):
 
         db_exec(
             """
-            INSERT INTO credit_loans
+            INSERT OR REPLACE INTO credit_loans
             (user_id, contract_code, principal_cents, term_days, rate_pct, created_ts, status,
              next_due_ts, end_ts, payment_cents, remaining_cents, postponed_cents, last_notice_ts, notice_msg_id)
             VALUES (?,?,?,?,?,?, 'active', ?,?,?,?,?, 0, 0)
@@ -2739,6 +2817,13 @@ def on_credit(call: CallbackQuery):
     if action == "cancel":
         sum_cents = int(parts[2]) if len(parts) > 2 else 0
         if sum_cents <= 0:
+            ok, msg = credit_amount_ok(uid, sum_cents)
+            if not ok:
+                kb = InlineKeyboardMarkup()
+                kb.add(InlineKeyboardButton("Назад в профиль", callback_data=cb_pack("profile:open", uid)))
+                edit_inline_or_message(call, f"<b>Ошибка:</b> {html_escape(msg)}", reply_markup=kb, parse_mode="HTML")
+                bot.answer_callback_query(call.id)
+                return    
             edit_inline_or_message(call, "Вы не указали сумму. Повторите свой запрос.", reply_markup=None, parse_mode="HTML")
             bot.answer_callback_query(call.id)
             return
@@ -3099,22 +3184,39 @@ def on_inline(q: InlineQuery):
             kb = InlineKeyboardMarkup()
             kb.add(InlineKeyboardButton("Внести выплату сразу", callback_data=cb_pack("credit:pay", uid)))
             kb.add(InlineKeyboardButton("Внести всю сумму долга досрочно", callback_data=cb_pack("credit:payfull", uid)))
+        
         else:
             sum_cents = int(stake_cents or 0)
+            min_c, max_c, wins = credit_limits_cents(uid)
+
             if sum_cents <= 0:
-                text = "Вы не указали сумму. Повторите свой запрос."
+                text = (
+                    "Вы указали недостоверную сумму, согласно лимиту.\n"
+                    f"Лимит кредита: <b>{cents_to_money_str(min_c)}</b>$ — <b>{cents_to_money_str(max_c)}</b>$.\n"
+                    "Повторите свой запрос с учетом лимита."
+                )
                 kb = InlineKeyboardMarkup()
             else:
-                text = (
-                    "<i><u>Кредитная организация ЧКО \"Контрактник\" ufs.666</u></i>\n"
-                    "Предоставление частных кредитных услуг на комфортные сроки под приятные процентные ставки.\n"
-                    f"Желаемая сумма: <b>{cents_to_money_str(sum_cents)}</b>$\n\n"
-                    "Выберите срок погашения кредита:"
+                ok, msg = credit_amount_ok(uid, sum_cents)
+                if not ok:
+                    text = (
+                        "<i><u>Кредитная организация ЧКО \"Контрактник\" ufs.666</u></i>\n"
+                        "Предоставление частных кредитных услуг на комфортные сроки под приятные процентные ставки.\n"
+                        f"Запрошено: <b>{cents_to_money_str(sum_cents)}</b>$\n\n"
+                        f"{html_escape(msg)}"
                     )
-                kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("30 дней", callback_data=cb_pack(f"credit:term:{sum_cents}:30", uid)))
-                kb.add(InlineKeyboardButton("60 дней", callback_data=cb_pack(f"credit:term:{sum_cents}:60", uid)))
-                kb.add(InlineKeyboardButton("90 дней", callback_data=cb_pack(f"credit:term:{sum_cents}:90", uid)))
+                    kb = InlineKeyboardMarkup()
+                else:
+                    text = (
+                        "<i><u>Кредитная организация ЧКО \"Контрактник\" ufs.666</u></i>\n"
+                        "Предоставление частных кредитных услуг на комфортные сроки под приятные процентные ставки.\n"
+                        f"Желаемая сумма: <b>{cents_to_money_str(sum_cents)}</b>$\n\n"
+                        "Выберите срок погашения кредита:"
+                    )
+                    kb = InlineKeyboardMarkup()
+                    kb.add(InlineKeyboardButton("30 дней", callback_data=cb_pack(f"credit:term:{sum_cents}:30", uid)))
+                    kb.add(InlineKeyboardButton("60 дней", callback_data=cb_pack(f"credit:term:{sum_cents}:60", uid)))
+                    kb.add(InlineKeyboardButton("90 дней", callback_data=cb_pack(f"credit:term:{sum_cents}:90", uid)))
     
         results.append(inline_article(
             "Кредит",
@@ -3611,24 +3713,34 @@ def on_main_callbacks(call: CallbackQuery):
                 f"(<b>{cents_to_money_str(lasth)}</b>$) "
                 f"+ <b>{cents_to_money_str(lastp)}</b>$"
             )
-    
-            cur.execute("""
-                SELECT owner_id FROM slavery
-                WHERE slave_id=? AND owner_id<>?
-                ORDER BY owner_id
-            """, (slave_id, clicker))
-            other = [int(x[0]) for x in cur.fetchall()]
-    
+
+            owners_all = get_slave_owners(slave_id)
+            other = [(oid, bp) for (oid, bp) in owners_all if int(oid) != int(clicker)]
+            
             if other:
+                total_bp = sum(int(bp or 0) for (_oid, bp) in owners_all) or 0
+                pay_map = {}
+                if buyout_cents > 0 and total_bp > 0 and owners_all:
+                    allocated = 0
+                    for i, (oid, bp) in enumerate(owners_all):
+                        part = (buyout_cents * int(bp or 0)) // total_bp
+                        pay_map[int(oid)] = int(part)
+                        allocated += int(part)
+                    pay_map[int(owners_all[0][0])] = pay_map.get(int(owners_all[0][0]), 0) + (buyout_cents - allocated)
+            
                 text += "\n\nВладельцы:\n"
-                for oid in other[:2]:
-                    cur.execute("SELECT short_name, username FROM users WHERE user_id=?", (oid,))
+                for oid, _bp in other:
+                    cur.execute("SELECT short_name, username FROM users WHERE user_id=?", (int(oid),))
                     rr = cur.fetchone() or ("Без имени", "")
                     oname = rr[0] or "Без имени"
                     oun = rr[1] or ""
                     ou_part = f" (@{html_escape(oun)})" if oun else ""
-                    text += f"{html_escape(oname)}{ou_part}\n"
-                text += "Для полноправного владения рабом, выкупите его командой /buy"
+                    price = int(pay_map.get(int(oid), 0) or 0)
+                    text += (
+                        f"{html_escape(oname)}{ou_part} | Сумма выкупа его доли: "
+                        f"<b>{cents_to_money_str(price)}</b>$\n"
+                    )
+                text += "Для полноправного владения рабом, выкупите его командой /rebuy"
     
             kb = InlineKeyboardMarkup()
             kb.add(InlineKeyboardButton("Назад к списку рабов", callback_data=cb_pack("profile:slaves", clicker)))
@@ -3945,18 +4057,6 @@ def on_buy_callbacks(call: CallbackQuery):
     action = parts[1]
     offer_id = parts[2]
 
-    buyer_bal = get_balance_cents(buyer_id)
-    if buyer_bal < 0 or buyer_bal < price_cents:
-        try:
-            bot.answer_callback_query(call.id, "Сделка сорвалась: у покупателя недостаточно средств.", show_alert=True)
-        except Exception:
-            pass
-        try:
-            bot.send_message(buyer_id, "Сделка /buy сорвалась: у вас недостаточно средств на оплату.")
-        except Exception:
-            pass
-        return
-
     cur.execute("SELECT slave_id, buyer_id, price_cents, active FROM buy_offers WHERE offer_id=?", (offer_id,))
     off = cur.fetchone()
     if not off:
@@ -3966,6 +4066,18 @@ def on_buy_callbacks(call: CallbackQuery):
     slave_id, buyer_id, price_cents, active = int(off[0]), int(off[1]), int(off[2]), int(off[3] or 0)
     if active != 1:
         bot.answer_callback_query(call.id, "Оффер уже закрыт.", show_alert=True)
+        return
+
+    buyer_bal = get_balance_cents(buyer_id)
+    if buyer_bal < 0 or buyer_bal < price_cents:
+        try:
+            bot.answer_callback_query(call.id, "Сделка сорвалась: у покупателя недостаточно средств.", show_alert=True)
+        except Exception:
+            pass
+        try:
+            bot.send_message(buyer_id, "Сделка сорвалась: у вас недостаточно средств на оплату.")
+        except Exception:
+            pass
         return
 
     cur.execute("SELECT status FROM buy_offer_resp WHERE offer_id=? AND owner_id=?", (offer_id, clicker))
@@ -4069,6 +4181,484 @@ def on_buy_callbacks(call: CallbackQuery):
         except Exception:
             pass
 
+# BUYRAB offers покупка раба
+def _buyrab_finalize_if_ready(offer_id: str):
+    """
+    Если все владельцы дали ответ, закрывает сделку:
+    - возвращает остаток hold покупателю
+    - помечает state=2
+    Возвращает dict с результатом или None, если сделка ещё не готова.
+    """
+    offer_id = str(offer_id or "")
+    if not offer_id:
+        return None
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute(
+                "SELECT tx_no, slave_id, buyer_id, total_cents, hold_cents, state "
+                "FROM buyrab_offers WHERE offer_id=?",
+                (offer_id,),
+            )
+            off = c.fetchone()
+            if not off:
+                conn.rollback()
+                return None
+
+            tx_no = int(off[0] or 0)
+            slave_id = int(off[1] or 0)
+            buyer_id = int(off[2] or 0)
+            total_cents = int(off[3] or 0)
+            hold_cents = int(off[4] or 0)
+            state = int(off[5] or 0)
+
+            if state != 1:
+                conn.rollback()
+                return None
+
+            c.execute(
+                "SELECT owner_id, pay_cents, status FROM buyrab_offer_resp WHERE offer_id=?",
+                (offer_id,),
+            )
+            rows = c.fetchall() or []
+            if not rows:
+                conn.rollback()
+                return None
+
+            pending = sum(1 for (_oid, _pay, st) in rows if int(st or 0) == 0)
+            if pending > 0:
+                conn.rollback()
+                return None
+
+            accepted = [(int(oid), int(pay or 0)) for (oid, pay, st) in rows if int(st or 0) == 1]
+            declined = [(int(oid), int(pay or 0)) for (oid, pay, st) in rows if int(st or 0) == -1]
+            owners_count = len(rows)
+
+            refund = max(0, hold_cents)
+            if refund > 0 and buyer_id > 0:
+                c.execute(
+                    "UPDATE users SET balance_cents=COALESCE(balance_cents,0)+? WHERE user_id=?",
+                    (refund, buyer_id),
+                )
+
+            c.execute(
+                "UPDATE buyrab_offers SET hold_cents=0, state=2 WHERE offer_id=?",
+                (offer_id,),
+            )
+            conn.commit()
+
+            spent = max(0, total_cents - refund)
+
+            return {
+                "offer_id": offer_id,
+                "tx_no": tx_no,
+                "slave_id": slave_id,
+                "buyer_id": buyer_id,
+                "total_cents": total_cents,
+                "spent_cents": spent,
+                "refund_cents": refund,
+                "owners_count": owners_count,
+                "accepted": accepted,
+                "declined": declined,
+            }
+
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return None
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("buyrab:"))
+def on_buyrab_callbacks(call: CallbackQuery):
+    base, owner = cb_unpack(call.data)
+    clicker = call.from_user.id
+
+    if owner is not None and owner != 0 and clicker != owner:
+        bot.answer_callback_query(call.id, "Вы не можете нажать на эту кнопку", show_alert=True)
+        return
+
+    parts = (base or "").split(":")
+    if len(parts) < 3:
+        bot.answer_callback_query(call.id)
+        return
+
+    action = parts[1]
+    offer_id = parts[2]
+
+    if action not in ("send", "cancel", "acc", "dec"):
+        bot.answer_callback_query(call.id)
+        return
+
+    if action in ("send", "cancel"):
+        with DB_LOCK:
+            c = conn.cursor()
+            try:
+                c.execute("BEGIN")
+                c.execute(
+                    "SELECT tx_no, slave_id, buyer_id, total_cents, state FROM buyrab_offers WHERE offer_id=?",
+                    (offer_id,),
+                )
+                off = c.fetchone()
+                if not off:
+                    conn.rollback()
+                    bot.answer_callback_query(call.id, "Сделка не найдена.", show_alert=True)
+                    return
+
+                tx_no = int(off[0] or 0)
+                slave_id = int(off[1] or 0)
+                buyer_id = int(off[2] or 0)
+                total_cents = int(off[3] or 0)
+                state = int(off[4] or 0)
+
+                if clicker != buyer_id:
+                    conn.rollback()
+                    bot.answer_callback_query(call.id, "Это не ваша сделка.", show_alert=True)
+                    return
+
+                if action == "cancel":
+                    if state != 0:
+                        conn.rollback()
+                        bot.answer_callback_query(call.id, "Сделка уже отправлена или закрыта.", show_alert=True)
+                        return
+                    c.execute("UPDATE buyrab_offers SET state=-1 WHERE offer_id=?", (offer_id,))
+                    c.execute("DELETE FROM buyrab_offer_resp WHERE offer_id=?", (offer_id,))
+                    conn.commit()
+
+                    try:
+                        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                    except Exception:
+                        pass
+                    try:
+                        bot.edit_message_text("Сделка отменена.", call.message.chat.id, call.message.message_id)
+                    except Exception:
+                        pass
+
+                    bot.answer_callback_query(call.id, "Отменено.")
+                    return
+
+                if state != 0:
+                    conn.rollback()
+                    bot.answer_callback_query(call.id, "Сделка уже отправлена или закрыта.", show_alert=True)
+                    return
+
+                c.execute("SELECT balance_cents FROM users WHERE user_id=?", (buyer_id,))
+                br = c.fetchone()
+                bal = int(br[0] or 0) if br else 0
+                if bal < total_cents or bal < 0:
+                    conn.rollback()
+                    bot.answer_callback_query(call.id, "Недостаточно средств для оформления сделки.", show_alert=True)
+                    return
+
+                c.execute(
+                    "UPDATE users SET balance_cents=COALESCE(balance_cents,0)-? WHERE user_id=?",
+                    (total_cents, buyer_id),
+                )
+                c.execute(
+                    "UPDATE buyrab_offers SET hold_cents=?, state=1 WHERE offer_id=?",
+                    (total_cents, offer_id),
+                )
+
+                c.execute("SELECT owner_id, pay_cents FROM buyrab_offer_resp WHERE offer_id=?", (offer_id,))
+                owner_rows = [(int(r[0]), int(r[1] or 0)) for r in (c.fetchall() or [])]
+
+                c.execute("SELECT short_name, username FROM users WHERE user_id=?", (slave_id,))
+                sr = c.fetchone() or (None, None)
+                slave_name = sr[0] or "Без имени"
+                slave_un = sr[1] or ""
+
+                c.execute("SELECT short_name, username FROM users WHERE user_id=?", (buyer_id,))
+                ur = c.fetchone() or (None, None)
+                buyer_name = ur[0] or "Покупатель"
+                buyer_un = ur[1] or ""
+
+                conn.commit()
+
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                bot.answer_callback_query(call.id, f"Ошибка: {e}", show_alert=True)
+                return
+            finally:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+
+        buyer_un_part = f" (@{html_escape(buyer_un)})" if buyer_un else ""
+        slave_un_part = f" (@{html_escape(slave_un)})" if slave_un else ""
+
+        failed = []
+        sent = 0
+        for oid, pay_cents in owner_rows:
+            kb = InlineKeyboardMarkup()
+            kb.row(
+                InlineKeyboardButton("Согласиться", callback_data=cb_pack(f"buyrab:acc:{offer_id}", oid)),
+                InlineKeyboardButton("Отказаться", callback_data=cb_pack(f"buyrab:dec:{offer_id}", oid)),
+            )
+            msg = (
+                f"Сделка купле-продажи раба №{tx_no}\n\n"
+                f"Объект сделки: раб <b>{html_escape(slave_name)}</b>{slave_un_part}\n"
+                f"Покупатель: <b>{html_escape(buyer_name)}</b>{buyer_un_part}\n"
+                f"Сумма к получению: <b>{cents_to_money_str(pay_cents)}</b>$\n"
+                f"Согласны на сделку?"
+            )
+            try:
+                bot.send_message(oid, msg, parse_mode="HTML", reply_markup=kb)
+                sent += 1
+            except Exception:
+                failed.append(oid)
+
+        if failed:
+            with DB_LOCK:
+                c = conn.cursor()
+                try:
+                    c.execute("BEGIN")
+                    for oid in failed:
+                        c.execute(
+                            "UPDATE buyrab_offer_resp SET status=-1 WHERE offer_id=? AND owner_id=? AND status=0",
+                            (offer_id, int(oid)),
+                        )
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        try:
+            bot.edit_message_text("Предложение отправлено владельцам.", call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+
+        bot.answer_callback_query(call.id, "Отправлено.")
+
+        fin = _buyrab_finalize_if_ready(offer_id)
+        if fin:
+            _send_buyrab_final(fin)
+
+        return
+
+    if action in ("acc", "dec"):
+        with DB_LOCK:
+            c = conn.cursor()
+            try:
+                c.execute("BEGIN")
+                c.execute(
+                    "SELECT tx_no, slave_id, buyer_id, total_cents, hold_cents, state "
+                    "FROM buyrab_offers WHERE offer_id=?",
+                    (offer_id,),
+                )
+                off = c.fetchone()
+                if not off:
+                    conn.rollback()
+                    bot.answer_callback_query(call.id, "Сделка не найдена.", show_alert=True)
+                    return
+
+                tx_no = int(off[0] or 0)
+                slave_id = int(off[1] or 0)
+                buyer_id = int(off[2] or 0)
+                hold_cents = int(off[4] or 0)
+                state = int(off[5] or 0)
+
+                if state != 1:
+                    conn.rollback()
+                    bot.answer_callback_query(call.id, "Сделка уже закрыта.", show_alert=True)
+                    return
+
+                c.execute(
+                    "SELECT pay_cents, status FROM buyrab_offer_resp WHERE offer_id=? AND owner_id=?",
+                    (offer_id, clicker),
+                )
+                rr = c.fetchone()
+                if not rr:
+                    conn.rollback()
+                    bot.answer_callback_query(call.id, "Это предложение не для вас.", show_alert=True)
+                    return
+                pay_cents = int(rr[0] or 0)
+                st = int(rr[1] or 0)
+                if st != 0:
+                    conn.rollback()
+                    bot.answer_callback_query(call.id, "Вы уже ответили.", show_alert=True)
+                    return
+
+                if action == "dec":
+                    c.execute(
+                        "UPDATE buyrab_offer_resp SET status=-1 WHERE offer_id=? AND owner_id=?",
+                        (offer_id, clicker),
+                    )
+                    conn.commit()
+
+                else:
+                    c.execute("SELECT share_bp FROM slavery WHERE slave_id=? AND owner_id=?", (slave_id, clicker))
+                    sr = c.fetchone()
+                    if not sr:
+                        c.execute(
+                            "UPDATE buyrab_offer_resp SET status=-1 WHERE offer_id=? AND owner_id=?",
+                            (offer_id, clicker),
+                        )
+                        conn.commit()
+                        bot.answer_callback_query(call.id, "У вас уже нет доли владения этим рабом.", show_alert=True)
+                        return
+                    seller_bp = int(sr[0] or 0)
+
+                    if pay_cents <= 0:
+                        c.execute(
+                            "UPDATE buyrab_offer_resp SET status=-1 WHERE offer_id=? AND owner_id=?",
+                            (offer_id, clicker),
+                        )
+                        conn.commit()
+                        bot.answer_callback_query(call.id, "Некорректная сумма сделки.", show_alert=True)
+                        return
+
+                    if int(hold_cents or 0) < pay_cents:
+                        c.execute(
+                            "UPDATE buyrab_offer_resp SET status=-1 WHERE offer_id=? AND owner_id=?",
+                            (offer_id, clicker),
+                        )
+                        conn.commit()
+                        bot.answer_callback_query(call.id, "У покупателя не хватает зарезервированных средств.", show_alert=True)
+                        return
+
+                    c.execute(
+                        "UPDATE users SET balance_cents=COALESCE(balance_cents,0)+? WHERE user_id=?",
+                        (pay_cents, clicker),
+                    )
+                    c.execute(
+                        "UPDATE buyrab_offers SET hold_cents=COALESCE(hold_cents,0)-? WHERE offer_id=?",
+                        (pay_cents, offer_id),
+                    )
+
+                    c.execute("DELETE FROM slavery WHERE slave_id=? AND owner_id=?", (slave_id, clicker))
+                    c.execute("SELECT share_bp FROM slavery WHERE slave_id=? AND owner_id=?", (slave_id, buyer_id))
+                    br2 = c.fetchone()
+                    if br2:
+                        new_bp = min(10000, int(br2[0] or 0) + seller_bp)
+                        c.execute(
+                            "UPDATE slavery SET share_bp=? WHERE slave_id=? AND owner_id=?",
+                            (new_bp, slave_id, buyer_id),
+                        )
+                    else:
+                        c.execute(
+                            "INSERT OR IGNORE INTO slavery (slave_id, owner_id, share_bp, earned_cents, acquired_ts) "
+                            "VALUES (?,?,?,?,?)",
+                            (slave_id, buyer_id, seller_bp, 0, now_ts()),
+                        )
+
+                    c.execute(
+                        "UPDATE buyrab_offer_resp SET status=1 WHERE offer_id=? AND owner_id=?",
+                        (offer_id, clicker),
+                    )
+                    conn.commit()
+
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                bot.answer_callback_query(call.id, f"Ошибка: {e}", show_alert=True)
+                return
+            finally:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+
+        bot.answer_callback_query(call.id, "Ответ учтён.")
+
+        fin = _buyrab_finalize_if_ready(offer_id)
+        if fin:
+            _send_buyrab_final(fin)
+
+        return
+
+def _send_buyrab_final(fin: dict):
+    """
+    Рассылает итог покупателю (и кратко уведомляет раба).
+    fin — результат из _buyrab_finalize_if_ready.
+    """
+    if not fin:
+        return
+
+    buyer_id = int(fin.get("buyer_id") or 0)
+    slave_id = int(fin.get("slave_id") or 0)
+    owners_count = int(fin.get("owners_count") or 0)
+    accepted = fin.get("accepted") or []
+    declined = fin.get("declined") or []
+    spent = int(fin.get("spent_cents") or 0)
+    refund = int(fin.get("refund_cents") or 0)
+
+    def _disp(uid: int) -> str:
+        u = get_user(uid)
+        nm = (u[2] if u and u[2] else "Без имени")
+        un = (u[1] if u and u[1] else "")
+        return f"{html_escape(nm)}" + (f" (@{html_escape(un)})" if un else "")
+
+    if accepted:
+        sellers = [_disp(int(oid)) for (oid, _pay) in accepted]
+        sellers_txt = ", ".join(sellers)
+
+        if len(sellers) == 1:
+            sellers_line = f"Продавец {sellers_txt}"
+        else:
+            sellers_line = f"Продавцы: {sellers_txt}"
+
+        txt = (
+            "Сделка прошла успешно!\n"
+            f"{sellers_line}\n"
+            f"Потраченная сумма: <b>{cents_to_money_str(spent)}</b>$"
+        )
+        if refund > 0 and declined:
+            txt += f"\nСумма к возврату: <b>{cents_to_money_str(refund)}</b>$"
+
+        try:
+            bot.send_message(buyer_id, txt, parse_mode="HTML")
+        except Exception:
+            pass
+
+        # уведомим раба, если купили хотя бы долю
+        try:
+            bot.send_message(
+                slave_id,
+                "Часть твоих прав владения перешла другому пользователю. Проверь текущих владельцев в профиле.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    else:
+        if owners_count > 1:
+            fail_txt = "Сделка сорвалась, ни один из владельцев этого \"товара\" не захотел отдавать свою часть."
+        else:
+            fail_txt = "Сделка сорвалась, владелец этого \"товара\" отказался от вашего предложения."
+        try:
+            bot.send_message(buyer_id, fail_txt)
+        except Exception:
+            pass
+
 # Game lobby rendering & handlers
 def render_lobby(game_id: str) -> Tuple[str, InlineKeyboardMarkup]:
     row = db_one(
@@ -4119,7 +4709,9 @@ def render_lobby(game_id: str) -> Tuple[str, InlineKeyboardMarkup]:
     )
 
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Присоединиться к игре", callback_data=f"game:join:{game_id}"))
+    max_players = 2 if stake_kind == "life_demon" else (5 if game_type in ("roulette", "cross") else None)
+    if max_players is None or len(players) < int(max_players):
+        kb.add(InlineKeyboardButton("Присоединиться к игре", callback_data=f"game:join:{game_id}"))
 
     for puid in pending_uids:
         kb.add(
@@ -4434,15 +5026,21 @@ def handle_join(call: CallbackQuery, game_id: str):
         return
     
     # life-mode rules
-    r = db_one("SELECT COALESCE(stake_kind,'money'), COALESCE(life_demon_id,0) FROM games WHERE game_id=?", (game_id,))
-    stake_kind = (r[0] if r else "money") or "money"
-    life_demon_id = int((r[1] if r else 0) or 0)
+
+    r = db_one(
+        "SELECT COALESCE(game_type,'roulette'), COALESCE(stake_kind,'money'), COALESCE(life_demon_id,0) "
+        "FROM games WHERE game_id=?",
+        (game_id,),
+    )
+    game_type = (r[0] if r else "roulette") or "roulette"
+    stake_kind = (r[1] if r else "money") or "money"
+    life_demon_id = int((r[2] if r else 0) or 0)
     
     if stake_kind == "life_demon":
         # максимум 2 игрока: демон + 1 оппонент
         cnt = db_one("SELECT COUNT(*) FROM game_players WHERE game_id=?", (game_id,))
         if cnt and int(cnt[0]) >= 2:
-            bot.answer_callback_query(call.id, "В этой игре на жизнь может быть только один оппонент.", show_alert=True)
+            bot.answer_callback_query(call.id, "Эта игра приватная", show_alert=True)
             return
     
         # demon vs demon: запрещено если ни у кого нет рабов
@@ -4452,13 +5050,19 @@ def handle_join(call: CallbackQuery, game_id: str):
             a = db_one("SELECT COUNT(*) FROM slavery WHERE owner_id=?", (int(life_demon_id),))
             b = db_one("SELECT COUNT(*) FROM slavery WHERE owner_id=?", (int(uid),))
             if int((a[0] if a else 0) or 0) == 0 and int((b[0] if b else 0) or 0) == 0:
-                bot.answer_callback_query(call.id, "Демоны не могут играть друг с другом без ставки на душу.", show_alert=True)
+                bot.answer_callback_query(call.id, "Демоны не могут играть друг с другом без соответствующей ставки", show_alert=True)
                 return
 
     cur.execute("SELECT 1 FROM game_players WHERE game_id=? AND user_id=?", (game_id, uid))
     if cur.fetchone():
         bot.answer_callback_query(call.id, "Ты уже в списке участников.", show_alert=True)
         return
+    
+    if stake_kind != "life_demon" and game_type in ("roulette", "cross"):
+        cnt = db_one("SELECT COUNT(*) FROM game_players WHERE game_id=?", (game_id,))
+        if int((cnt[0] if cnt else 0) or 0) >= 5:
+            bot.answer_callback_query(call.id, "Лобби заполнено.", show_alert=True)
+            return
 
     u = get_user(uid)
     if not u or not u[2]:
@@ -5862,6 +6466,12 @@ def cmd_del(message):
 
             c.execute("DELETE FROM buy_offer_resp WHERE owner_id=?", (target_id,))
             c.execute("DELETE FROM buy_offers WHERE buyer_id=? OR slave_id=?", (target_id, target_id))
+            c.execute(
+                "DELETE FROM buyrab_offer_resp WHERE offer_id IN (SELECT offer_id FROM buyrab_offers WHERE buyer_id=? OR slave_id=?)",
+                (target_id, target_id)
+            )
+            c.execute("DELETE FROM buyrab_offer_resp WHERE owner_id=?", (target_id,))
+            c.execute("DELETE FROM buyrab_offers WHERE buyer_id=? OR slave_id=?", (target_id, target_id))
 
             c.execute("DELETE FROM work_stats WHERE user_id=?", (target_id,))
             c.execute("DELETE FROM work_shift WHERE user_id=?", (target_id,))
@@ -5981,6 +6591,225 @@ def cmd_profile(message):
     )
     bot.send_message(message.chat.id, text, parse_mode="HTML")
 
+@bot.message_handler(commands=["rabs"])
+def cmd_rabs(message):
+    if message.chat.type != "private":
+        return
+
+    viewer_id = message.from_user.id
+    upsert_user(viewer_id, getattr(message.from_user, "username", None))
+
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].startswith("@"):
+        bot.reply_to(message, "Использование: /rabs @username")
+        return
+
+    owner_un = parts[1][1:].strip()
+    rr = db_one("SELECT user_id, short_name, username FROM users WHERE username=? COLLATE NOCASE", (owner_un,))
+    if not rr:
+        bot.reply_to(message, "Пользователь не найден в базе.")
+        return
+
+    owner_id = int(rr[0])
+    owner_name = rr[1] or "Без имени"
+    owner_username = rr[2] or ""
+
+    cur.execute("""
+        SELECT slave_id, COALESCE(earned_cents,0), COALESCE(share_bp,0), COALESCE(acquired_ts,0)
+        FROM slavery
+        WHERE owner_id=?
+        ORDER BY COALESCE(earned_cents,0) DESC
+    """, (owner_id,))
+    rows = cur.fetchall() or []
+
+    head_owner_un = f" (@{html_escape(owner_username)})" if owner_username else ""
+    intro = (
+        f"Список рабов пользователя <b>{html_escape(owner_name)}</b>{head_owner_un}\n"
+        "Чтобы приобрести раба, используйте команду /buyrab\n\n"
+    )
+
+    if not rows:
+        bot.send_message(message.chat.id, intro + "Пусто", parse_mode="HTML")
+        return
+
+    lines = ["Имя|Общий доход|За последнее время|Последнее зачисление"]
+    top = rows[:20]
+    for i, (slave_id, earned_cents, _share_bp, _acquired_ts) in enumerate(top, 1):
+        slave_id = int(slave_id)
+        earned_cents = int(earned_cents or 0)
+        lasth = int(slave_profit_lasth(slave_id, owner_id) or 0)
+        lastp = int(slave_last_credit(slave_id, owner_id) or 0)
+
+        cur.execute("SELECT short_name, username FROM users WHERE user_id=?", (slave_id,))
+        r = cur.fetchone() or (None, None)
+        sname = r[0] or "Без имени"
+        sun = r[1] or ""
+
+        uname_part = f" (@{html_escape(sun)})" if sun else ""
+        lines.append(
+            f"{i}|<b>{html_escape(sname)}</b>{uname_part} "
+            f"<u><b>{cents_to_money_str(earned_cents)}</b>$</u>"
+            f"(<b>{cents_to_money_str(lasth)}</b>$) "
+            f"+ <b>{cents_to_money_str(lastp)}</b>$"
+        )
+
+    bot.send_message(message.chat.id, intro + "\n".join(lines), parse_mode="HTML")
+
+@bot.message_handler(commands=["buyrab"])
+def cmd_buyrab(message):
+    if message.chat.type != "private":
+        return
+
+    buyer_id = message.from_user.id
+    buyer_un = getattr(message.from_user, "username", None)
+    upsert_user(buyer_id, buyer_un)
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].startswith("@"):
+        bot.reply_to(message, "Использование: /buyrab @username [сумма]")
+        return
+
+    target_uname = parts[1][1:].strip()
+    custom_total = None
+    if len(parts) >= 3 and parts[2].strip():
+        raw = parts[2].replace("$", "").strip()
+        custom_total = money_to_cents(raw)
+        if custom_total is None or custom_total <= 0:
+            bot.reply_to(message, "Неверная сумма. Пример ввода 15000 или 15000.50")
+            return
+
+    rr = db_one(
+        "SELECT user_id, short_name, username FROM users WHERE username=? COLLATE NOCASE",
+        (target_uname,),
+    )
+    if not rr:
+        bot.reply_to(message, "Пользователь не найден.")
+        return
+
+    slave_id = int(rr[0])
+    slave_name = rr[1] or "Без имени"
+    slave_username = rr[2] or ""
+    slave_un_part = f" (@{html_escape(slave_username)})" if slave_username else ""
+
+    if slave_id == buyer_id:
+        bot.reply_to(message, "Насколько не была бы ценна ваша душа, поверьте, вам не хватит средств, чтобы выкупить её.")
+        return
+
+    if not is_slave(slave_id):
+        bot.reply_to(message, "Этот пользователь не является рабом.")
+        return
+
+    if db_one("SELECT 1 FROM slavery WHERE slave_id=? AND owner_id=? LIMIT 1", (slave_id, buyer_id)):
+        bot.reply_to(message, "Вы уже являетесь владельцем этого раба. Для выкупа доли с владения раба используйте /rebuy.")
+        return
+
+    db_exec("INSERT OR IGNORE INTO slave_meta (slave_id) VALUES (?)", (slave_id,), commit=True)
+    row = db_one("SELECT buyout_cents FROM slave_meta WHERE slave_id=?", (slave_id,))
+    buyout_cents = int((row or (0,))[0] or 0)
+    if buyout_cents <= 0:
+        bot.reply_to(message, "У этого раба не назначена цена выкупа.")
+        return
+
+    owners = get_slave_owners(slave_id)
+    if not owners:
+        bot.reply_to(message, "У этого раба нет владельцев.")
+        return
+
+    if db_one(
+        "SELECT 1 FROM buyrab_offers WHERE slave_id=? AND buyer_id=? AND state IN (0,1) LIMIT 1",
+        (slave_id, buyer_id),
+    ):
+        bot.reply_to(message, "У вас уже есть активная сделка на этого раба. Дождитесь ответа владельцев или отмените прошлую.")
+        return
+
+    total_cents = int(custom_total if custom_total is not None else buyout_cents)
+
+    if total_cents <= 0:
+        bot.reply_to(message, "Некорректная сумма сделки.")
+        return
+
+    buyer_bal = get_balance_cents(buyer_id)
+    if buyer_bal < total_cents or buyer_bal < 0:
+        bot.reply_to(
+            message,
+            f"Недостаточно средств. Нужно: {cents_to_money_str(total_cents)}$, на балансе: {cents_to_money_str(buyer_bal)}$.",
+        )
+        return
+
+    total_bp = sum(int(bp or 0) for (_oid, bp) in owners) or 0
+    if total_bp <= 0:
+        bot.reply_to(message, "Некорректные доли владельцев у раба.")
+        return
+
+    pay_parts = []
+    allocated = 0
+    for i, (oid, bp) in enumerate(owners):
+        part = (total_cents * int(bp or 0)) // total_bp
+        pay_parts.append([int(oid), int(part)])
+        allocated += int(part)
+    rem = total_cents - allocated
+    if pay_parts:
+        pay_parts[0][1] += rem
+
+    offer_id = uuid.uuid4().hex
+    tx_no = random.randint(10000, 99999)
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute(
+                "INSERT INTO buyrab_offers (offer_id, tx_no, slave_id, buyer_id, total_cents, hold_cents, created_ts, state) "
+                "VALUES (?,?,?,?,?,?,?,0)",
+                (offer_id, tx_no, slave_id, buyer_id, total_cents, 0, now_ts()),
+            )
+            for oid, pay_cents in pay_parts:
+                c.execute(
+                    "INSERT OR REPLACE INTO buyrab_offer_resp (offer_id, owner_id, pay_cents, status) VALUES (?,?,?,0)",
+                    (offer_id, int(oid), int(pay_cents)),
+                )
+            conn.commit()
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            bot.reply_to(message, f"Ошибка создания сделки: {e}")
+            return
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    owners_disp = []
+    for oid, _bp in owners:
+        u = get_user(int(oid))
+        nm = (u[2] if u and u[2] else "Без имени")
+        un = (u[1] if u and u[1] else "")
+        owners_disp.append(f"{html_escape(nm)}" + (f" (@{html_escape(un)})" if un else ""))
+    owners_line = ", ".join(owners_disp) if owners_disp else "-"
+
+    explain = "каждый владелец получит свою долю, равную цене выкупа его доли."
+    if custom_total is not None and custom_total != buyout_cents:
+        explain = "сумма будет распределена между владельцами пропорционально их долям владения."
+
+    txt = (
+        "Проверьте данные, перед приобретением \"товара\":\n"
+        f"Имя раба: <b>{html_escape(slave_name)}</b>{slave_un_part}\n"
+        f"Владельцы: {owners_line}\n"
+        f"Цена к оплате: <b>{cents_to_money_str(total_cents)}</b>$\n"
+        f"{explain}"
+    )
+
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("Согласиться и отправить", callback_data=cb_pack(f"buyrab:send:{offer_id}", buyer_id)),
+        InlineKeyboardButton("Отказаться", callback_data=cb_pack(f"buyrab:cancel:{offer_id}", buyer_id)),
+    )
+
+    bot.send_message(message.chat.id, txt, parse_mode="HTML", reply_markup=kb)
+
 @bot.message_handler(commands=["buyout"])
 def cmd_buyout(message):
     if message.chat.type != "private":
@@ -6033,7 +6862,7 @@ def cmd_buyout(message):
         if part > 0:
             add_balance(oid, part)
             distributed += part
-            notify_safe(oid, f"Раб выкупил себя. Сумма, которую он оставил вам за свою свободу: <b>{cents_to_money_str(part)}</b>$",)
+            notify_safe(oid, f"Раб выкупил себя. Сумма, которую он оставил вам за свою свободу <b>{cents_to_money_str(part)}</b>$",)
 
     free_slave_fully(uid, "самовыкуп")
 
@@ -6043,7 +6872,7 @@ def cmd_buyout(message):
         parse_mode="HTML"
     )
 
-@bot.message_handler(commands=["buy"])
+@bot.message_handler(commands=["rebuy"])
 def cmd_buy(message):
     if message.chat.type != "private":
         return
@@ -6054,7 +6883,7 @@ def cmd_buy(message):
 
     parts = (message.text or "").split()
     if len(parts) < 3 or not parts[1].startswith("@"):
-        bot.reply_to(message, "Использование: /buy @username цена")
+        bot.reply_to(message, "Использование: /rebuy @username цена")
         return
 
     slave_un = parts[1][1:]
@@ -6120,11 +6949,11 @@ def cmd_buy(message):
     buyer_tag = f"@{buyer_un}" if buyer_un else html_escape(buyer_name)
 
     text = (
-        f"Предложение о выкупе раба:\n\n"
+        f"Предложение о выкупе раба\n\n"
         f"Раб: <b>{html_escape(slave_name)}</b> (@{html_escape(slave_un)})\n"
         f"Покупатель: <b>{html_escape(buyer_tag)}</b>\n"
-        f"Цена за твою долю: <b>{cents_to_money_str(price_cents)}</b>$\n\n"
-        f"Согласиться?"
+        f"Предлагаемая цена выкупа: <b>{cents_to_money_str(price_cents)}</b>$\n\n"
+        f"Согласны на сделку?"
     )
 
     kb = InlineKeyboardMarkup()
