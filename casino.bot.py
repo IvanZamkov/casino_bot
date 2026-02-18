@@ -654,6 +654,28 @@ CREATE TABLE IF NOT EXISTS credit_loans (
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS transfers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_id INTEGER NOT NULL,
+  to_id INTEGER NOT NULL,
+  amount_cents INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  comment TEXT,
+  chat_id INTEGER DEFAULT 0,
+  msg_id INTEGER DEFAULT 0
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS user_custom_status (
+  user_id INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  added_ts INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, status)
+)
+""")
+
 conn.commit()
 
 def ensure_game_origin_columns():
@@ -1000,6 +1022,132 @@ def add_balance(uid: int, delta_cents: int):
         commit=True
     )
 
+def resolve_user_id_ref(ref: str) -> Optional[int]:
+    """
+    Разрешает пользователя из ссылки вида:
+      - @username
+      - числовой user_id
+    Возвращает user_id если пользователь есть в базе, иначе None.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+
+    if ref.startswith("@"):
+        uname = ref[1:].strip()
+        if not uname:
+            return None
+        r = db_one("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (uname,))
+        return int(r[0]) if r else None
+
+    if ref.isdigit():
+        uid = int(ref)
+        r = db_one("SELECT 1 FROM users WHERE user_id=?", (uid,))
+        return uid if r else None
+
+    return None
+
+def get_custom_statuses(uid: int) -> List[str]:
+    rows = db_all(
+        "SELECT status FROM user_custom_status WHERE user_id=? ORDER BY added_ts, status",
+        (int(uid),)
+    )
+    out: List[str] = []
+    for r in rows or []:
+        s = str((r[0] if r else "") or "").strip()
+        if s:
+            out.append(s)
+    return out
+
+def add_custom_status(uid: int, status: str) -> bool:
+    status = str(status or "").strip()
+    if not status:
+        return False
+    # небольшой лимит, чтобы не ломать вёрстку
+    if len(status) > 64:
+        status = status[:64]
+    db_exec(
+        "INSERT OR IGNORE INTO user_custom_status (user_id, status, added_ts) VALUES (?,?,?)",
+        (int(uid), status, now_ts()),
+        commit=True
+    )
+    return True
+
+def transfer_balance(
+    from_uid: int,
+    to_uid: int,
+    amount_cents: int,
+    *,
+    comment: str = "",
+    chat_id: int = 0,
+    msg_id: int = 0,
+) -> Tuple[bool, str, int, int, int]:
+    """
+    Атомарный перевод денег между пользователями.
+    Возвращает: (ok, reason, sender_balance, receiver_balance, transfer_id)
+    """
+    from_uid = int(from_uid)
+    to_uid = int(to_uid)
+    amount_cents = int(amount_cents)
+
+    if amount_cents <= 0:
+        return False, "bad_amount", get_balance_cents(from_uid), get_balance_cents(to_uid), 0
+    if from_uid == to_uid:
+        return False, "self", get_balance_cents(from_uid), get_balance_cents(to_uid), 0
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+
+            # гарантируем строки пользователей
+            ts = now_ts()
+            c.execute("INSERT OR IGNORE INTO users (user_id, created_ts) VALUES (?,?)", (from_uid, ts))
+            c.execute("INSERT OR IGNORE INTO users (user_id, created_ts) VALUES (?,?)", (to_uid, ts))
+
+            c.execute("SELECT COALESCE(balance_cents,0) FROM users WHERE user_id=?", (from_uid,))
+            sbal = int((c.fetchone() or [0])[0] or 0)
+            if sbal < amount_cents:
+                conn.rollback()
+                c.execute("SELECT COALESCE(balance_cents,0) FROM users WHERE user_id=?", (to_uid,))
+                rbal = int((c.fetchone() or [0])[0] or 0)
+                return False, "insufficient", sbal, rbal, 0
+
+            c.execute(
+                "UPDATE users SET balance_cents = COALESCE(balance_cents,0) - ? WHERE user_id=?",
+                (amount_cents, from_uid)
+            )
+            c.execute(
+                "UPDATE users SET balance_cents = COALESCE(balance_cents,0) + ? WHERE user_id=?",
+                (amount_cents, to_uid)
+            )
+
+            c.execute(
+                "INSERT INTO transfers (from_id, to_id, amount_cents, ts, comment, chat_id, msg_id) VALUES (?,?,?,?,?,?,?)",
+                (from_uid, to_uid, amount_cents, ts, (comment or "")[:500], int(chat_id or 0), int(msg_id or 0))
+            )
+            transfer_id = int(c.lastrowid or 0)
+
+            c.execute("SELECT COALESCE(balance_cents,0) FROM users WHERE user_id=?", (from_uid,))
+            sbal2 = int((c.fetchone() or [0])[0] or 0)
+            c.execute("SELECT COALESCE(balance_cents,0) FROM users WHERE user_id=?", (to_uid,))
+            rbal2 = int((c.fetchone() or [0])[0] or 0)
+
+            conn.commit()
+            return True, "ok", sbal2, rbal2, transfer_id
+
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False, f"error:{e}", get_balance_cents(from_uid), get_balance_cents(to_uid), 0
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
 def set_contract_signed(uid: int, gift_cents: int):
     db_exec("""
     UPDATE users
@@ -1199,16 +1347,38 @@ def compute_status(uid: int) -> str:
     u = get_user(uid)
     if not u:
         return "-"
+
+    uid = int(uid)
     bal = int(u[5] or 0)
     demon = int(u[7] or 0)
 
-    if demon == 1:
-        return "ĐĒʋÍ£" + (", Бот-админ" if uid == OWNER_ID else "")
-    
-    statuses = []
-    # админ
-    if uid == OWNER_ID:
+    def _dedup_keep_order(items: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for it in items:
+            it = str(it or "").strip()
+            if not it or it in seen:
+                continue
+            seen.add(it)
+            out.append(it)
+        return out
+
+    statuses: List[str] = []
+
+    # админ (владелец бота)
+    if uid == int(OWNER_ID):
         statuses.append("Бот-админ")
+
+    # кастомные статусы (выданы владельцем)
+    try:
+        statuses.extend(get_custom_statuses(uid))
+    except Exception:
+        pass
+
+    if demon == 1:
+        statuses = _dedup_keep_order(statuses)
+        return "ĐĒʋÍ£" + (", " + ", ".join(statuses) if statuses else "")
+
     # капитал
     if bal >= 2_000_000_000_00:
         statuses.append("Мультимиллиардер")
@@ -1220,12 +1390,14 @@ def compute_status(uid: int) -> str:
         statuses.append("Миллионер")
     elif bal <= -1_000_000 * 100:
         statuses.append("Великий должник")
+
     # раб
     if is_slave(uid):
         statuses.append("Раб")
-    # удача/неудача по играм 
+
+    # удача/неудача по играм
     try:
-        r = db_one("SELECT wins, losses, games FROM game_stats WHERE user_id=?", (uid,))
+        r = db_one("SELECT wins, losses, games_total FROM game_stats WHERE user_id=?", (uid,))
         if r:
             wins, losses, games = int(r[0] or 0), int(r[1] or 0), int(r[2] or 0)
             if games > 0:
@@ -1235,6 +1407,7 @@ def compute_status(uid: int) -> str:
                     statuses.append("Неудачник со стажем")
     except Exception:
         pass
+
     # богатейший/нищета
     try:
         rows = db_all("SELECT user_id FROM users WHERE demon=0", ())
@@ -1251,7 +1424,7 @@ def compute_status(uid: int) -> str:
     # Вечный узник: раб > полугода
     if is_slave(uid):
         try:
-            r = db_one("SELECT COALESCE(MIN(acquired_ts),0) FROM slavery WHERE slave_id=?", (int(uid),))
+            r = db_one("SELECT COALESCE(MIN(acquired_ts),0) FROM slavery WHERE slave_id=?", (uid,))
             acq = int((r[0] if r else 0) or 0)
             if acq > 0 and (now_ts() - acq) >= 180 * 24 * 3600:
                 statuses.append("Вечный узник")
@@ -1265,7 +1438,7 @@ def compute_status(uid: int) -> str:
     except Exception:
         pass
 
-    # Ломаный рот этой рулетки: проиграть марафон (cross) в последнем раунде на сумму > 1,000,000$
+    # Ломаный рот этой рулетки
     try:
         r = db_one("""
             SELECT 1
@@ -1277,12 +1450,13 @@ def compute_status(uid: int) -> str:
               AND gr.user_id=?
               AND COALESCE(gr.delta_cents,0) <= ?
             LIMIT 1
-        """, (int(uid), -1_000_000 * 100))
+        """, (uid, -1_000_000 * 100))
         if r:
             statuses.append("Ломаный рот этой рулетки")
     except Exception:
         pass
 
+    statuses = _dedup_keep_order(statuses)
     return ", ".join(statuses) if statuses else "Без статуса"
 
 def get_demon_streak(uid: int) -> int:
@@ -1376,7 +1550,7 @@ SHOP_ITEMS = {
     },
     "paket": {
         "title": "📑 Пакет соц.поддержки",
-        "price_cents": 1500_00,
+        "price_cents": 2000_00,
         "max_qty": 1,
         "duration_games": 1,
         "desc": "Заверено нотариусом! Несколько важных бумаг в одном пакете: страхование капитала, социальный пакет, денежная компенсация! С ним вернется полная стоимость вашего проигрыша! Однако, всё имеет свою цену...",
@@ -1697,6 +1871,7 @@ def shop_clear_used(uid: int, game_id: str):
 def shop_tick_after_game(uid: int, game_id: str):
     """
     Списываем 1 'игру' со всех активных эффектов пользователя ТОЛЬКО если они были привязаны к этой игре.
+    Для insurance/paket списываем только если эффект реально сработал в этой игре.
     """
     bound = shop_get_bound_game(uid)
 
@@ -1711,12 +1886,15 @@ def shop_tick_after_game(uid: int, game_id: str):
         shop_clear_bind(uid)
         return
 
-    for k, rem in active.items():
+    for k, rem in list(active.items()):
         if k in ("insurance", "paket"):
-            if not shop_is_used(uid, game_id, "insurance"):
+            if not shop_is_used(uid, game_id, k):  
                 continue
-        shop_set_active(uid, k, rem - 1)
+
+        shop_set_active(uid, k, int(rem) - 1)
+
     shop_clear_bind(uid)
+    shop_clear_used(uid, game_id)
 
 def shop_menu_text(uid: int) -> str:
     u = get_user(uid)
@@ -3034,8 +3212,7 @@ def on_inline(q: InlineQuery):
         if life_flag:
             game_text = (
                 "<b><u>⟢♣♦ Игры ♥♠⟣</u></b>\n\n"
-                "Текущая ставка: <b>ҖนՅዙ৮</b>\n"
-                f"Расчётная ставка: <b>{cents_to_money_str(stake_cents)}</b>$\n"
+                f"Текущая ставка: <b>{cents_to_money_str(stake_cents)}</b>$\n"
                 "Выберите игру:"
             )
         else:
@@ -3499,6 +3676,7 @@ def on_main_callbacks(call: CallbackQuery):
             "Список команд модерирования\n"
             "☛ профиль /profile\n"
             "Статусы ☚\n"
+            "☛ кастомный /addstatus"
             "☛ демон /devil\n"
             "☛ человек /human\n"
             "☛ удалить раба /delrab\n"
@@ -4701,8 +4879,7 @@ def render_lobby(game_id: str) -> Tuple[str, InlineKeyboardMarkup]:
     stake_line = f"Текущая ставка: <b>{cents_to_money_str(int(stake_cents))}</b>$"
     if stake_kind == "life_demon":
         stake_line = (
-            "Текущая ставка: <b>ҖนՅዙ৪</b>\n"
-            f"Расчётная ставка: <b>{cents_to_money_str(int(stake_cents))}</b>$"
+            f"Текущая ставка: <b>{cents_to_money_str(int(stake_cents))}</b>$"
         )
 
     text = (
@@ -5628,7 +5805,7 @@ def on_spin_pull(call: CallbackQuery):
             strow = db_one("SELECT status FROM game_players WHERE game_id=? AND user_id=?", (game_id, uid))
             pstatus = (strow[0] if strow else "") or ""
             if pstatus == "life":
-                stake_line = "Ставка: <b>Ӂนℨℍ৮</b>"
+                stake_line = "Ставка: <b>1000$</b>"
             else:
                 stake_line = f"Ставка: <b>{cents_to_money_str(int(stake_now))}</b>$"
                 if game_type == "cross":
@@ -6279,6 +6456,38 @@ def cmd_take(message):
 
     bot.reply_to(message, f"Списано {cents_to_money_str(amt)}$ у пользователя @{uname}")
 
+@bot.message_handler(commands=["addstatus"])
+def cmd_addstatus(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    if message.chat.type != "private":
+        return
+
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=2)
+    if len(parts) < 3:
+        bot.reply_to(message, "Использование: /addstatus @username текст_статуса")
+        return
+
+    target = parts[1].strip()
+    status_txt = parts[2].strip()
+
+    if not target.startswith("@"):
+        bot.reply_to(message, "Использование: /addstatus @username текст_статуса")
+        return
+
+    uname = target[1:].strip()
+    rr = db_one("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (uname,))
+    if not rr:
+        bot.reply_to(message, "Пользователь не найден в базе.")
+        return
+
+    uid = int(rr[0])
+    if add_custom_status(uid, status_txt):
+        bot.reply_to(message, f"Готово. Пользователю @{uname} добавлен статус: {status_txt}")
+    else:
+        bot.reply_to(message, "Пустой статус не добавлен.")
+
 @bot.message_handler(commands=["reg"])
 def cmd_reg(message):
     if message.from_user.id != OWNER_ID:
@@ -6402,8 +6611,6 @@ def cmd_work(message):
     except Exception:
         pass
 
-
-
 @bot.message_handler(commands=["delrab"])
 def cmd_delstat(message):
     if message.from_user.id != OWNER_ID:
@@ -6493,6 +6700,9 @@ def cmd_del(message):
             c.execute("DELETE FROM life_wait WHERE user_id=?", (target_id,))
             c.execute("DELETE FROM demon_streak WHERE user_id=?", (target_id,))
             c.execute("DELETE FROM credit_loans WHERE user_id=?", (target_id,))
+
+            c.execute("DELETE FROM user_custom_status WHERE user_id=?", (target_id,))
+            c.execute("DELETE FROM transfers WHERE from_id=? OR to_id=?", (target_id, target_id))
 
             c.execute("DELETE FROM game_players WHERE user_id=?", (target_id,))
             c.execute("DELETE FROM game_results WHERE user_id=?", (target_id,))
@@ -6595,6 +6805,103 @@ def cmd_profile(message):
         f"Место в топе: <b>{place}</b>"
     )
     bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+@bot.message_handler(commands=["pay"])
+def cmd_pay(message):
+    sender_id = int(message.from_user.id)
+    sender_un = getattr(message.from_user, "username", None)
+    upsert_user(sender_id, sender_un)
+
+    if not is_registered(sender_id):
+        bot.reply_to(message, "Сначала подпишите контракт через /start.")
+        return
+
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=3)
+
+    target_id: Optional[int] = None
+    amount_str: Optional[str] = None
+    comment = ""
+
+    if message.reply_to_message and len(parts) >= 2 and not parts[1].startswith("@"):
+        target_user = message.reply_to_message.from_user
+        target_id = int(target_user.id)
+        upsert_user(target_id, getattr(target_user, "username", None))
+        amount_str = parts[1]
+        comment = parts[2] if len(parts) >= 3 else ""
+    else:
+        # вариант: /pay @username сумма [комментарий]
+        if len(parts) < 3:
+            bot.reply_to(
+                message,
+                "Использование: /pay @username сумма [комментарий]\n"
+                "или ответом на сообщение: /pay сумма [комментарий]"
+            )
+            return
+
+        target_ref = parts[1].strip()
+        if not target_ref.startswith("@"):
+            bot.reply_to(message, "Использование: /pay @username сумма [комментарий]")
+            return
+
+        target_un = target_ref[1:].strip()
+        rr = db_one("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (target_un,))
+        if not rr:
+            bot.reply_to(message, "Пользователь не найден в базе. Пусть сначала напишет боту /start.")
+            return
+
+        target_id = int(rr[0])
+        amount_str = parts[2]
+        comment = parts[3] if len(parts) >= 4 else ""
+
+    amt = money_to_cents(amount_str or "")
+    if amt is None or int(amt) <= 0:
+        bot.reply_to(message, "Неверная сумма.")
+        return
+
+    ok, reason, sbal, rbal, _tid = transfer_balance(
+        sender_id, int(target_id), int(amt),
+        comment=comment,
+        chat_id=int(message.chat.id),
+        msg_id=int(message.message_id)
+    )
+
+    if not ok:
+        if reason == "insufficient":
+            bot.reply_to(message, f"Недостаточно средств. Ваш баланс: {cents_to_money_str(int(sbal))}$")
+            return
+        if reason == "self":
+            bot.reply_to(message, "Нельзя переводить деньги самому себе.")
+            return
+        bot.reply_to(message, "Не удалось выполнить перевод. Попробуйте позже.")
+        return
+
+    su = get_user(sender_id)
+    sname = (su[2] if su and su[2] else None) or (su[1] if su and su[1] else None) or (sender_un or str(sender_id))
+    sun = (su[1] if su and su[1] else "") or ""
+    sun_part = f" (@{html_escape(sun)})" if sun else ""
+
+    tu = get_user(int(target_id))
+    tname = (tu[2] if tu and tu[2] else None) or (tu[1] if tu and tu[1] else None) or str(target_id)
+    tun = (tu[1] if tu and tu[1] else "") or ""
+    tun_part = f" (@{html_escape(tun)})" if tun else ""
+
+    bot.reply_to(
+        message,
+        f"Перевод выполнен: <b>{cents_to_money_str(int(amt))}</b>$ → <b>{html_escape(tname)}</b>{tun_part}\n"
+        f"Ваш баланс: <b>{cents_to_money_str(int(sbal))}</b>$",
+        parse_mode="HTML"
+    )
+
+    try:
+        bot.send_message(
+            int(target_id),
+            f"Вам перевели <b>{cents_to_money_str(int(amt))}</b>$ от <b>{html_escape(sname)}</b>{sun_part}.\n"
+            f"Ваш баланс: <b>{cents_to_money_str(int(rbal))}</b>$",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
 
 @bot.message_handler(commands=["rabs"])
 def cmd_rabs(message):
