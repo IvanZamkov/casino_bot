@@ -22,7 +22,7 @@ from telebot.types import (
 
 # CONFIG
 OWNER_ID = int(os.environ.get("OWNER_ID", "7739179390"))
-MAX_LIFE_STAKES = 3  # сколько раз можно поставить жизнь
+MAX_LIFE_STAKES = 5  # сколько раз можно поставить жизнь
 def load_bot_token() -> str:
     """
     Приоритет:
@@ -758,9 +758,10 @@ def money_to_cents(x: str) -> Optional[int]:
         a, b = x, "00"
     return int(a) * 100 + int(b)
 
-def cents_to_money_str(cents: int) -> str:
+def cents_to_money_str(cents: Optional[int]) -> str:
+    cents = int(cents or 0)
     sign = "-" if cents < 0 else ""
-    cents = abs(int(cents))
+    cents = abs(cents)
     return f"{sign}{cents//100}.{cents%100:02d}"
 
 def safe_format(template: str, **kwargs) -> str:
@@ -1048,8 +1049,7 @@ def _mail_letter_text(kind: str, amount_cents: int) -> str:
 
     if kind == "demon_pay":
         return (
-            "Демоны всегда держат обещания. В этот раз удача на твоей стороне.\n"
-            f"<i>к письму прилагается чек на <b>{amt}</b>$</i>"
+            "Демоны всегда держат обещания. В этот раз удача на твоей стороне."
         )
 
     if kind == "intro":
@@ -3515,14 +3515,14 @@ def on_main_callbacks(call: CallbackQuery):
             bot.answer_callback_query(call.id)
             return
 
-        lines = ["Список вашего второстепенного дохода"]
-        lines = ["Имя|Общий доход|За последнее время|Последнее зачисление"]
+        lines = ["Список вашего второстепенного дохода\nИмя|Общий доход|За последнее время|Последнее зачисление"]
         top = rows[:20]
         for i, (slave_id, earned_cents, share_bp, acquired_ts) in enumerate(top, 1):
             slave_id = int(slave_id)
             earned_cents = int(earned_cents or 0)
             lasth = slave_profit_lasth(slave_id, clicker)
-            lastp = slave_last_credit(slave_id, clicker)
+            lastp = int(slave_last_credit(slave_id, clicker) or 0)
+
 
             cur.execute("SELECT short_name, username FROM users WHERE user_id=?", (slave_id,))
             r = cur.fetchone() or (None, None)
@@ -3533,7 +3533,8 @@ def on_main_callbacks(call: CallbackQuery):
             lines.append(
                 f"{i}|<b>{html_escape(sname)}</b>{uname_part} "
                 f"<u><b>{cents_to_money_str(earned_cents)}</b>$</u>"
-                f"(<b>{cents_to_money_str(lasth)}</b>$) + <b>{cents_to_money_str(lastp)}</b>$"
+                f"(<b>{cents_to_money_str(lasth)}</b>$) "
+                f"+ <b>{cents_to_money_str(lastp)}</b>$"
             )
 
         kb = InlineKeyboardMarkup()
@@ -3586,7 +3587,7 @@ def on_main_callbacks(call: CallbackQuery):
     
             earned_cents, share_bp, acquired_ts = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
             lasth = slave_profit_lasth(slave_id, clicker)
-            lastp = slave_last_credit(slave_id, clicker)
+            lastp = int(slave_last_credit(slave_id, clicker) or 0)
     
             cur.execute("SELECT short_name, username FROM users WHERE user_id=?", (slave_id,))
             r = cur.fetchone() or ("Без имени", "")
@@ -3605,9 +3606,10 @@ def on_main_callbacks(call: CallbackQuery):
             text = (
                 f"<b>{html_escape(sname)}</b>{uname_part} <i>{html_escape(ts_txt)}</i>\n"
                 f"Цена раба: <b>{cents_to_money_str(buyout_cents)}</b>$\n"
-                "Общий доход|За последнее время|Последнее начисление"
+                "Общий доход|За последнее время|Последнее начисление\n"
                 f"<u><b>{cents_to_money_str(earned_cents)}</b>$</u>"
-                f"(<b>{cents_to_money_str(lasth)}</b>$) + <b>{cents_to_money_str(lastp)}</b>$"
+                f"(<b>{cents_to_money_str(lasth)}</b>$) "
+                f"+ <b>{cents_to_money_str(lastp)}</b>$"
             )
     
             cur.execute("""
