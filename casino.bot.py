@@ -18,11 +18,24 @@ from telebot.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
+    InputMediaPhoto,
 )
 
 # CONFIG
 OWNER_ID = int(os.environ.get("OWNER_ID", "7739179390"))
 MAX_LIFE_STAKES = 5  # сколько раз можно поставить жизнь
+PHOTO_FILE_ID = os.environ.get("ZERO_PHOTO_FILE_ID", "AgACAgIAAxkBAAPBaZ38U4pV3G6c4JFrmMMD1-aU0nUAAiwUaxsXG_BIB9b_4FJoVCoBAAMCAAN3AAM6BA")  # file_id для фото в Зеро-рулетке
+
+INLINE_THUMB_START_URL = os.environ.get("INLINE_THUMB_START_URL", "")
+INLINE_THUMB_BAN_URL = os.environ.get("INLINE_THUMB_BAN_URL", "")
+INLINE_THUMB_GAME_URL = os.environ.get("INLINE_THUMB_GAME_URL", "")
+INLINE_THUMB_PROFILE_URL = os.environ.get("INLINE_THUMB_PROFILE_URL", "")
+INLINE_THUMB_STATS_URL = os.environ.get("INLINE_THUMB_STATS_URL", "")
+INLINE_THUMB_WORK_URL = os.environ.get("INLINE_THUMB_WORK_URL", "")
+INLINE_THUMB_CREDIT_URL = os.environ.get("INLINE_THUMB_CREDIT_URL", "")
+
+_INLINE_THUMB_URL_CACHE: dict[str, str] = {}
+
 def load_bot_token() -> str:
     """
     Приоритет:
@@ -34,7 +47,7 @@ def load_bot_token() -> str:
         return token
 
     try:
-        import config_local  # type: ignore # файл рядом с ботом
+        import config_local  # type: ignore файл рядом с ботом
         token = str(getattr(config_local, "BOT_TOKEN", "") or "").strip()
         if token:
             return token
@@ -197,7 +210,6 @@ def limited_edit_message_text(*, text: str, reply_markup=None, parse_mode: str =
         except Exception:
             pass
 
-
 ME = bot.get_me()
 BOT_USERNAME = ME.username
 
@@ -213,7 +225,6 @@ DB_PATH = os.path.join(DATA_DIR, "contest_bot.db")            # новая ба�
 # Авто-перенос базы при первом запуске после патча
 if os.path.exists(OLD_DB_PATH) and (not os.path.exists(DB_PATH)):
     try:
-        # Попробуем аккуратно влить WAL в основную БД перед переносом
         _c = sqlite3.connect(OLD_DB_PATH, check_same_thread=False)
         _c.execute("PRAGMA journal_mode=WAL;")
         try:
@@ -264,7 +275,6 @@ print("journal_mode:", cur.execute("PRAGMA journal_mode;").fetchone())
 print("wal_autocheckpoint:", cur.execute("PRAGMA wal_autocheckpoint;").fetchone())
 
 DB_LOCK = threading.RLock()
-# Влить WAL в основную базу на старте (особенно полезно после переносов/рестартов)
 with DB_LOCK:
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -431,7 +441,7 @@ CREATE TABLE IF NOT EXISTS demon_loot (
 )
 """)
 
-try:  # ensure slave_meta has life_uses column (migration)
+try:  # ensure slave_meta has life_uses column
     cur.execute("ALTER TABLE slave_meta ADD COLUMN life_uses INTEGER DEFAULT 0")
 except Exception:
     pass
@@ -550,6 +560,13 @@ CREATE TABLE IF NOT EXISTS shop_used (
 """)
 
 cur.execute("""
+CREATE TABLE IF NOT EXISTS shop_cooldowns (
+    user_id INTEGER PRIMARY KEY,
+    next_protect_ts INTEGER NOT NULL DEFAULT 0
+)
+""")
+
+cur.execute("""
 CREATE TABLE IF NOT EXISTS shop_catalog (
     user_id INTEGER PRIMARY KEY,
     cycle_start_ts INTEGER NOT NULL,
@@ -578,6 +595,15 @@ CREATE TABLE IF NOT EXISTS game_players (
   user_id INTEGER,
   status TEXT,          -- 'pending'|'ready'|'anon_pending'
   PRIMARY KEY (game_id, user_id)
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS turn_orders (
+  game_id TEXT PRIMARY KEY,
+  order_csv TEXT NOT NULL,
+  round INTEGER NOT NULL DEFAULT 0,
+  updated_ts INTEGER NOT NULL DEFAULT 0
 )
 """)
 
@@ -611,6 +637,45 @@ CREATE TABLE IF NOT EXISTS spins (
   inline_id TEXT,
   grid_text TEXT,          -- текущий вид слотов
   started_ts INTEGER,
+  PRIMARY KEY (game_id, user_id)
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS zero_bets (
+  game_id TEXT,
+  user_id INTEGER,
+  slot INTEGER,        -- 0..4 по порядку выбора
+  code TEXT,           -- N1..N36 | Z | E|O|R|B
+  PRIMARY KEY (game_id, user_id, slot)
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS zero_lock (
+  game_id TEXT,
+  user_id INTEGER,
+  locked INTEGER DEFAULT 0,
+  PRIMARY KEY (game_id, user_id)
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS zero_state (
+  game_id TEXT PRIMARY KEY,
+  stage TEXT DEFAULT 'betting',     -- betting|reveal|done
+  revealed INTEGER DEFAULT 0,       -- 0..5
+  gen_csv TEXT DEFAULT '',
+  gen_ts INTEGER DEFAULT 0
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS zero_outcomes (
+  game_id TEXT,
+  user_id INTEGER,
+  combo TEXT DEFAULT '',
+  mult REAL DEFAULT 1.0,
   PRIMARY KEY (game_id, user_id)
 )
 """)
@@ -706,6 +771,30 @@ CREATE TABLE IF NOT EXISTS user_custom_status (
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS bans (
+  user_id INTEGER PRIMARY KEY,
+  banned INTEGER NOT NULL DEFAULT 1,
+  ts INTEGER NOT NULL,
+  until_ts INTEGER NOT NULL DEFAULT 0,
+  by_id INTEGER DEFAULT 0,
+  reason TEXT
+)
+""")
+try:
+    cur.execute("ALTER TABLE bans ADD COLUMN until_ts INTEGER NOT NULL DEFAULT 0")
+except Exception:
+    pass
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS report_state (
+  user_id INTEGER PRIMARY KEY,
+  category TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  created_ts INTEGER NOT NULL
+)
+""")
+
 conn.commit()
 
 def ensure_game_origin_columns():
@@ -786,11 +875,21 @@ def ensure_transfer_columns():
 
 ensure_transfer_columns()
 
+def ensure_shop_cooldowns():
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS shop_cooldowns (
+      user_id INTEGER PRIMARY KEY,
+      next_protect_ts INTEGER NOT NULL DEFAULT 0
+    )
+    """)
+    conn.commit()
+
+ensure_shop_cooldowns()
+
 # Runtime DB: безопасный "cur" 
 # До этого места "cur" был реальным sqlite3.Cursor и использовался для миграций/DDL.
 # Дальше в рантайме он НЕ должен быть реальным курсором, иначе при потоках ловим:
 # sqlite3.ProgrammingError: Recursive use of cursors not allowed.
-
 try:
     cur.close()
 except Exception:
@@ -851,7 +950,7 @@ class CurProxy:
             return rows
         return rows[idx:]
 
-# Подменяем cur на безопасный прокси для всего рантайма
+# безопасный cur прокси для всего рантайма
 cur = CurProxy()
 
 # Helpers
@@ -884,6 +983,112 @@ def safe_format(template: str, **kwargs) -> str:
         def __missing__(self, key):
             return "{" + key + "}"
     return template.format_map(DD(**kwargs))
+
+# Moderation helpers
+def parse_duration_to_seconds(token: str) -> Optional[int]:
+    """
+    Примеры: 30m, 24h, 7d, 2w
+    Возвращает:
+      - int секунд
+      - 0 для перманентного бана (perm/0/forever)
+      - None если токен не похож на длительность
+    """
+    t = (token or "").strip().lower()
+    if not t:
+        return None
+    if t in ("perm", "permanent", "forever", "inf", "infty", "infinite", "0"):
+        return 0
+    m = re.fullmatch(r"(\d+)\s*([smhdw])", t)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    if n <= 0:
+        return 0
+    mul = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}[unit]
+    return int(n * mul)
+
+def _fmt_ts(ts: int) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
+    except Exception:
+        return str(ts)
+
+def get_ban_info(uid: int) -> Tuple[bool, int, str]:
+    """
+    Возвращает (banned, until_ts, reason).
+    until_ts=0 => перманентный бан.
+    Если бан истёк — автоматически снимает.
+    """
+    r = db_one(
+        "SELECT COALESCE(banned,0), COALESCE(until_ts,0), COALESCE(reason,'') FROM bans WHERE user_id=? LIMIT 1",
+        (int(uid),)
+    )
+    if not r:
+        return False, 0, ""
+
+    banned = int(r[0] or 0)
+    until_ts = int(r[1] or 0)
+    reason = str(r[2] or "")
+
+    if banned != 1:
+        return False, 0, reason
+
+    if until_ts > 0 and now_ts() >= until_ts:
+        try:
+            db_exec("UPDATE bans SET banned=0, until_ts=0 WHERE user_id=?", (int(uid),), commit=True)
+        except Exception:
+            pass
+        return False, 0, reason
+
+    return True, until_ts, reason
+
+def is_banned(uid: int) -> bool:
+    return get_ban_info(uid)[0]
+def ban_user(uid: int, by_id: int = 0, reason: str = "", *, duration_sec: int = 0) -> int:
+    """
+    Банит пользователя.
+    duration_sec:
+      - 0 => перманентно
+      - >0 => временно, до now + duration_sec
+    Возвращает until_ts (0 если перманентно).
+    """
+    until_ts = 0
+    if int(duration_sec or 0) > 0:
+        until_ts = now_ts() + int(duration_sec)
+
+    db_exec(
+        "INSERT INTO bans (user_id, banned, ts, until_ts, by_id, reason) VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET banned=1, ts=excluded.ts, until_ts=excluded.until_ts, by_id=excluded.by_id, reason=excluded.reason",
+        (int(uid), 1, now_ts(), int(until_ts), int(by_id or 0), (reason or "")[:500]),
+        commit=True
+    )
+    return int(until_ts)
+
+def unban_user(uid: int, by_id: int = 0, reason: str = "") -> None:
+    db_exec(
+        "INSERT INTO bans (user_id, banned, ts, until_ts, by_id, reason) VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET banned=0, ts=excluded.ts, until_ts=0, by_id=excluded.by_id, reason=excluded.reason",
+        (int(uid), 0, now_ts(), 0, int(by_id or 0), (reason or "")[:500]),
+        commit=True
+    )
+
+def report_set_state(uid: int, category: str, stage: str) -> None:
+    db_exec(
+        "INSERT INTO report_state (user_id, category, stage, created_ts) VALUES (?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET category=excluded.category, stage=excluded.stage, created_ts=excluded.created_ts",
+        (int(uid), str(category), str(stage), now_ts()),
+        commit=True
+    )
+
+def report_get_state(uid: int) -> Tuple[Optional[str], Optional[str]]:
+    r = db_one("SELECT stage, category FROM report_state WHERE user_id=?", (int(uid),))
+    if not r:
+        return None, None
+    return (r[0], r[1])
+
+def report_clear_state(uid: int) -> None:
+    db_exec("DELETE FROM report_state WHERE user_id=?", (int(uid),), commit=True)
 
 # Credit helpers
 CREDIT_INTERVAL_SEC = 2 * 24 * 3600
@@ -1143,7 +1348,7 @@ def add_custom_status(uid: int, status: str) -> bool:
     )
     return True
 
-# PAY: комиссия + анти-фрод блокировка переводов
+# PAY
 PAY_FRAUD_WINDOW_SEC = 24 * 3600
 PAY_FRAUD_BLOCK_SEC = 24 * 3600
 
@@ -1217,7 +1422,6 @@ def calc_pay_fee_cents(amount_cents: int) -> int:
 
     # округляем вверх до цента
     return int((amount_cents * bp + 9999) // 10000)
-
 
 def transfer_balance(
     from_uid: int,
@@ -1323,7 +1527,7 @@ def transfer_balance(
             if c1m_new >= 3 or c100k_new >= 5 or c0_new >= 10:
                 until = ts + int(PAY_FRAUD_BLOCK_SEC)
                 c.execute(
-                    "INSERT OR REPLACE INTO transfer_blocks (user_id, until_ts, reason, created_ts, first_notice_ts) VALUES (?,?,?,?,0)"
+                    "INSERT OR REPLACE INTO transfer_blocks (user_id, until_ts, reason, created_ts, first_notice_ts) VALUES (?,?,?,?,0)",
                     (from_uid, until, "suspicious", ts)
                 )
                 
@@ -1450,6 +1654,8 @@ def get_favorite_game_title(uid: int) -> str:
         gt = (row[0] or "").strip()
         if gt == "cross":
             return "Марафон рулетка"
+        if gt == "zero":
+            return "Зеро-рулетка"
         if gt == "roulette":
             return "Рулетка"
         # fallback
@@ -1615,16 +1821,17 @@ def compute_status(uid: int) -> str:
 
     statuses: List[str] = []
 
-    # админ (владелец бота)
+    # админ / владелец бота
     if uid == int(OWNER_ID):
         statuses.append("Бот-админ")
 
-    # кастомные статусы (выданы владельцем)
+    # кастомные статусы
     try:
         statuses.extend(get_custom_statuses(uid))
     except Exception:
         pass
 
+    # демон
     if demon == 1:
         statuses = _dedup_keep_order(statuses)
         return "ĐĒʋÍ£" + (", " + ", ".join(statuses) if statuses else "")
@@ -1793,19 +2000,72 @@ SHOP_ITEMS = {
     },
     "insurance": {
         "title": "📜 Страхование капитала",
-        "price_cents": 1000_00,
+        "price_cents": 1300_00,
         "max_qty": 1,
         "duration_games": 1,
         "desc": "Защита ваших денежных средств в случае непредвиденных затрат. Полностью сохраняет Ваши финансы от проигрыша. Всё бы ничего, однако материал бумаги подозрительно схож со структурой контракта... Рискуем?",
     },
     "paket": {
         "title": "📑 Пакет соц.поддержки",
-        "price_cents": 2000_00,
+        "price_cents": 1600_00,
         "max_qty": 1,
         "duration_games": 1,
         "desc": "Заверено нотариусом! Несколько важных бумаг в одном пакете: страхование капитала, социальный пакет, денежная компенсация! С ним вернется полная стоимость вашего проигрыша! Однако, всё имеет свою цену...",
     },
+        "lucky_chip": {
+        "title": "🉐 Удачная фишка",
+        "price_cents": 777_00,
+        "max_qty": 3,
+        "duration_games": 2,
+        "desc": "С шансом 25% хотя бы две ваши ставки из прогноза будут выигрышными. Фишка с именной меткой. Интересно, чья она?",
+    },
+    "black_chip": {
+        "title": "⚫ Черная фишка",
+        "price_cents": 400_00,
+        "max_qty": 4,
+        "duration_games": 1,
+        "desc": "Увеличивает шанс Чёрного на 5%",
+    },
+    "red_chip": {
+        "title": "🔴 Красная фишка",
+        "price_cents": 400_00,
+        "max_qty": 4,
+        "duration_games": 1,
+        "desc": "Увеличивает шанс Красного на 5%",
+    },
 }
+
+# SHOP: какие предметы работают в какой игре
+SHOP_ZERO_ONLY_ITEMS = {"lucky_chip", "black_chip", "red_chip"}
+SHOP_ROULETTE_ONLY_ITEMS = {"magnet", "fake_clover", "wine", "devil_pepper"}
+
+def shop_allowed_items_for_game_type(game_type: str) -> set:
+    game_type = (game_type or "roulette").strip().lower()
+    if game_type == "zero":
+        return {"insurance", "paket"} | set(SHOP_ZERO_ONLY_ITEMS)
+    return set(SHOP_ITEMS.keys()) - set(SHOP_ZERO_ONLY_ITEMS)
+
+# SHOP: cooldown for "insurance" + "paket"
+SHOP_PROTECT_COOLDOWN_SEC = 4 * 3600
+
+def shop_get_protect_next_ts(uid: int) -> int:
+    r = db_one("SELECT COALESCE(next_protect_ts,0) FROM shop_cooldowns WHERE user_id=?", (int(uid),))
+    if not r:
+        db_exec("INSERT OR IGNORE INTO shop_cooldowns (user_id, next_protect_ts) VALUES (?,0)", (int(uid),), commit=True)
+        return 0
+    return int((r[0] if r else 0) or 0)
+
+def shop_set_protect_next_ts(uid: int, next_ts: int) -> None:
+    db_exec(
+        "INSERT INTO shop_cooldowns (user_id, next_protect_ts) VALUES (?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET next_protect_ts=excluded.next_protect_ts",
+        (int(uid), int(next_ts)),
+        commit=True
+    )
+
+def shop_protect_cooldown_left(uid: int) -> int:
+    left = shop_get_protect_next_ts(uid) - now_ts()
+    return max(0, int(left))
 
 # SHOP: dynamic pricing (balance-based)
 SHOP_PRICE_STEP_CENTS = 5000_00  # each full $ on balance increases price
@@ -1834,12 +2094,15 @@ def shop_dynamic_price_cents(uid: int, key: str, balance_cents: int | None = Non
     price = (num + 1) // 2
     return int(price), int(steps)
 
-
 SHOP_CATALOG_PERIOD_SEC = 3 * 24 * 3600 
 SHOP_CATALOG_SIZE = len(SHOP_ITEMS)
 
 def _shop_catalog_regen(uid: int) -> List[str]:
     keys = list(SHOP_ITEMS.keys())
+
+    if is_slave(uid) and "paket" in keys:
+        keys = [k for k in keys if k != "paket"]
+
     random.shuffle(keys)
     picks = keys[:min(SHOP_CATALOG_SIZE, len(keys))]
     cur.execute(
@@ -1865,6 +2128,10 @@ def get_shop_catalog(uid: int) -> List[str]:
         return _shop_catalog_regen(uid)
 
     keys = [k for k in (row[1] or "").split(",") if k and k in SHOP_ITEMS]
+
+    if is_slave(uid):
+        keys = [k for k in keys if k != "paket"]
+
     if not keys:
         return _shop_catalog_regen(uid)
     return keys
@@ -1920,7 +2187,6 @@ def _boost_emoji_for_item(item_key: str) -> str:
         return first
     return ""
 
-
 def render_active_boosts_line(player_name: str, active: dict) -> str:
     """
     Новый формат:
@@ -1948,6 +2214,49 @@ def render_active_boosts_line(player_name: str, active: dict) -> str:
 
     pname = (player_name or "").strip() or "Игрок"
     return f"Усиления {pname}:\n" + " ".join(icons)
+
+def render_zero_boosts_inline(active: dict) -> str:
+    """
+    Для Зеро-рулетки:
+    'Усиления: 🉐 🔴 ⚫ 📜'
+    Показываем только если есть активные эффекты (remaining_games > 0).
+    """
+    if not active:
+        return ""
+
+    preferred_order = ["lucky_chip", "red_chip", "black_chip", "insurance", "paket"]
+
+    icons: list[str] = []
+
+    def _push(key: str):
+        try:
+            if int(active.get(key, 0) or 0) <= 0:
+                return
+        except Exception:
+            return
+        ic = _boost_emoji_for_item(key)
+        if ic:
+            icons.append(ic)
+
+    for k in preferred_order:
+        _push(k)
+
+    for k, v in (active or {}).items():
+        if k in preferred_order:
+            continue
+        try:
+            if int(v or 0) <= 0:
+                continue
+        except Exception:
+            continue
+        ic = _boost_emoji_for_item(str(k))
+        if ic:
+            icons.append(ic)
+
+    if not icons:
+        return ""
+
+    return "Усиления: " + " ".join(icons)
 
 def shop_set_active(uid: int, key: str, remaining: int):
     remaining = int(remaining)
@@ -2026,11 +2335,29 @@ def shop_get_earliest_active_game(uid: int) -> str | None:
 def shop_get_active_for_game(uid: int, game_id: str) -> dict:
     """
     Активные эффекты магазина, применяемые ТОЛЬКО к привязанной игре.
-    Главное отличие: если привязка указывает на "зависшее" старое lobby — очищаем её и даём привязаться к текущей игре.
+
+    Дополнительно:
+    - фильтруем предметы по типу игры (в Зеро не работают клевер/магнит/вино/перец; в рулетке не работают зеро-фишки)
+    - если привязка указывает на "зависшее" старое lobby — очищаем её и даём привязаться к текущей игре.
     """
     active = shop_get_active(uid)
     if not active:
         return {}
+
+    gt = db_one("SELECT COALESCE(game_type,'roulette') FROM games WHERE game_id=?", (str(game_id),))
+    game_type = (gt[0] if gt else "roulette") or "roulette"
+    allowed = shop_allowed_items_for_game_type(str(game_type))
+
+    def _filter(d: dict) -> dict:
+        out = {}
+        for k, v in (d or {}).items():
+            try:
+                vv = int(v or 0)
+            except Exception:
+                vv = 0
+            if vv > 0 and k in allowed:
+                out[k] = vv
+        return out
 
     now = int(time.time())
     bound = shop_get_bound_game(uid)
@@ -2056,29 +2383,36 @@ def shop_get_active_for_game(uid: int, game_id: str) -> dict:
                 bound = None
 
     if bound:
-        return active if bound == game_id else {}
+        return _filter(active) if bound == game_id else {}
 
     earliest = shop_get_earliest_active_game(uid)
     if earliest and earliest == game_id:
         shop_bind_to_game(uid, game_id)
-        return active
+        return _filter(active)
 
     return {}
 
 def shop_buy(uid: int, key: str) -> tuple[bool, str]:
     if key not in SHOP_ITEMS:
         return False, "Товар не найден."
+
+    if key == "paket" and is_slave(uid):
+        return False, "Этот товар недоступен для рабов."
+
     item = SHOP_ITEMS[key]
     have = shop_get_qty(uid, key)
     if have >= item["max_qty"]:
         return False, "У тебя уже максимальное количество этого предмета."
+
     u = get_user(uid)
     if not u or not u[2]:
-        return False
+        return False, "Нет анкеты."
+
     bal = int(u[5] or 0)
     price, price_steps = shop_dynamic_price_cents(uid, key, bal)
     if bal < price:
         return False, f"Недостаточно средств. Необходимо {cents_to_money_str(price)}$"
+
     add_balance(uid, -price)
     shop_set_qty(uid, key, have + 1)
     return True, "Покупка прошла успешно."
@@ -2086,15 +2420,32 @@ def shop_buy(uid: int, key: str) -> tuple[bool, str]:
 def shop_activate(uid: int, key: str) -> tuple[bool, str]:
     if key not in SHOP_ITEMS:
         return False, "Товар не найден."
+
+    if key == "paket" and is_slave(uid):
+        return False, "Этот товар недоступен для рабов."
+
+    if key in ("insurance", "paket"):
+        left = shop_protect_cooldown_left(uid)
+        if left > 0:
+            nxt = shop_get_protect_next_ts(uid)
+            nxt_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(nxt)))
+            return False, f"Следующая активация доступна {nxt_txt} (через {_format_duration(left)})."
+
     item = SHOP_ITEMS[key]
     have = shop_get_qty(uid, key)
     if have <= 0:
         return False, "У тебя нет этого предмета."
+
     active = shop_get_active(uid)
     if key in active and active[key] > 0:
         return False, "Этот эффект уже активен."
+
     shop_set_qty(uid, key, have - 1)
     shop_set_active(uid, key, int(item["duration_games"]))
+
+    if key in ("insurance", "paket"):
+        shop_set_protect_next_ts(uid, now_ts() + SHOP_PROTECT_COOLDOWN_SEC)
+
     return True, f"Активировано на {item['duration_games']} игр."
 
 def shop_mark_used(uid: int, game_id: str, item_key: str):
@@ -2121,15 +2472,17 @@ def shop_clear_used(uid: int, game_id: str):
 def shop_tick_after_game(uid: int, game_id: str):
     """
     Списываем 1 'игру' со всех активных эффектов пользователя ТОЛЬКО если они были привязаны к этой игре.
+
+    Дополнительно: списываем только те предметы, которые реально работают в данном типе игры.
     Для insurance/paket списываем только если эффект реально сработал в этой игре.
     """
     bound = shop_get_bound_game(uid)
-
-    if not bound:
+    if not bound or bound != game_id:
         return
 
-    if bound != game_id:
-        return
+    gt = db_one("SELECT COALESCE(game_type,'roulette') FROM games WHERE game_id=?", (str(game_id),))
+    game_type = (gt[0] if gt else "roulette") or "roulette"
+    allowed = shop_allowed_items_for_game_type(str(game_type))
 
     active = shop_get_active(uid)
     if not active:
@@ -2137,8 +2490,11 @@ def shop_tick_after_game(uid: int, game_id: str):
         return
 
     for k, rem in list(active.items()):
+        if k not in allowed:
+            continue
+
         if k in ("insurance", "paket"):
-            if not shop_is_used(uid, game_id, k):  
+            if not shop_is_used(uid, game_id, k):
                 continue
 
         shop_set_active(uid, k, int(rem) - 1)
@@ -2195,20 +2551,47 @@ def shop_item_text(uid: int, key: str) -> str:
     price, price_steps = shop_dynamic_price_cents(uid, key, bal)
     markup_line = (f"Надбавка к цене: <b>+{price_steps * SHOP_PRICE_STEP_ADD_PCT}%</b>\n" if price_steps > 0 else "")
 
+    cooldown_line = ""
+    if key in ("insurance", "paket"):
+        left = shop_protect_cooldown_left(uid)
+        if left > 0:
+            nxt = shop_get_protect_next_ts(uid)
+            nxt_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(nxt)))
+            cooldown_line = f"Следующая активация: <b>{nxt_txt}</b> (через {_format_duration(left)})\n"
+
+    warn = ""
+    if key == "paket" and is_slave(uid):
+        warn = "\n<b>Недоступно для рабов.</b>\n"
+
     return (
         f"{html_escape(item['title'])}\n\n"
-        f"{html_escape(item['desc'])}\n\n"
+        f"{html_escape(item['desc'])}\n"
+        f"{warn}\n"
         f"Цена: <b>{cents_to_money_str(int(price))}</b>$\n"
         f"{markup_line}"
         f"Количество: <b>{have}</b> из <b>{item['max_qty']}</b>\n"
+        f"{cooldown_line}"
         f"Активен: <b>{rem}</b> игр"
     )
 
 def shop_item_kb(uid: int, key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
+
+    if key == "paket" and is_slave(uid):
+        kb.add(InlineKeyboardButton("Назад", callback_data=cb_pack("shop:open", uid)))
+        return kb
+
     kb.add(InlineKeyboardButton("Купить", callback_data=cb_pack(f"shop:buy:{key}", uid)))
-    if shop_get_qty(uid, key) > 0 and shop_get_active(uid).get(key, 0) <= 0:
+
+    can_activate = (shop_get_qty(uid, key) > 0) and (shop_get_active(uid).get(key, 0) <= 0)
+
+    if can_activate and key in ("insurance", "paket"):
+        if shop_protect_cooldown_left(uid) > 0:
+            can_activate = False
+
+    if can_activate:
         kb.add(InlineKeyboardButton("Активировать", callback_data=cb_pack(f"shop:act:{key}", uid)))
+
     kb.add(InlineKeyboardButton("Назад", callback_data=cb_pack("shop:open", uid)))
     return kb
 
@@ -2921,7 +3304,11 @@ def on_shop_callbacks(call: CallbackQuery):
     if owner is not None and clicker != owner:
         bot.answer_callback_query(call.id, "Вы не можете нажать на эту кнопку", show_alert=True)
         return
-
+    
+    if is_banned(clicker):
+        bot.answer_callback_query(call.id, "Вам нечего здесь делать.", show_alert=True)
+        return
+    
     parts = base.split(":")
     action = parts[1] if len(parts) > 1 else "open"
     uid = owner if owner is not None else clicker
@@ -3375,9 +3762,77 @@ def edit_inline_or_message(call: CallbackQuery, text: str, reply_markup=None, pa
         )
         return
 
+def zero_media_enabled() -> bool:
+    fid = (PHOTO_FILE_ID or "").strip()
+    return bool(fid) and fid != "PASTE_YOUR_FILE_ID_HERE"
+
+def edit_zero_message(
+    call: CallbackQuery,
+    text: str,
+    reply_markup=None,
+    parse_mode: Optional[str] = None,
+    force_media: bool = False
+):
+    """
+    Для Зеро-рулетки:
+    - если PHOTO_FILE_ID задан => сообщение становится фото+caption (force_media=True),
+      далее обновляем caption.
+    - если PHOTO_FILE_ID не задан => обычное edit_message_text.
+    """
+    if not zero_media_enabled():
+        edit_inline_or_message(call, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return
+
+    inline_id = getattr(call, "inline_message_id", None)
+
+    if force_media:
+        try:
+            media = InputMediaPhoto(media=PHOTO_FILE_ID, caption=text, parse_mode=parse_mode)
+            if inline_id:
+                bot.edit_message_media(inline_message_id=inline_id, media=media, reply_markup=reply_markup)
+                return
+            if getattr(call, "message", None):
+                bot.edit_message_media(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    media=media,
+                    reply_markup=reply_markup
+                )
+                return
+        except Exception:
+            pass
+
+        edit_inline_or_message(call, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return
+
+    try:
+        if inline_id:
+            bot.edit_message_caption(
+                inline_message_id=inline_id,
+                caption=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup
+            )
+            return
+        if getattr(call, "message", None):
+            bot.edit_message_caption(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                caption=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup
+            )
+            return
+    except Exception:
+        pass
+
+    edit_inline_or_message(call, text, reply_markup=reply_markup, parse_mode=parse_mode)
+
 # INLINE MENU
-def inline_article(title: str, desc: str, text: str, kb: InlineKeyboardMarkup) -> InlineQueryResultArticle:
-    return InlineQueryResultArticle(
+def inline_article(title: str, desc: str, text: str, kb, thumb_key: str = "") -> InlineQueryResultArticle:
+    tu = get_inline_thumb_url(thumb_key)
+
+    base_kwargs = dict(
         id=str(uuid.uuid4()),
         title=title,
         description=desc,
@@ -3385,11 +3840,120 @@ def inline_article(title: str, desc: str, text: str, kb: InlineKeyboardMarkup) -
         reply_markup=kb
     )
 
+    if tu:
+        try:
+            return InlineQueryResultArticle(**base_kwargs, thumbnail_url=tu)
+        except TypeError:
+            try:
+                return InlineQueryResultArticle(**base_kwargs, thumb_url=tu)
+            except TypeError:
+                res = InlineQueryResultArticle(**base_kwargs)
+                try:
+                    res.thumb_url = tu
+                except Exception:
+                    pass
+                try:
+                    res.thumbnail_url = tu
+                except Exception:
+                    pass
+                return res
+
+    return InlineQueryResultArticle(**base_kwargs)
+
+_INLINE_THUMB_VARNAMES = { # inline thumbs: key -> config var name
+    "start": "INLINE_THUMB_START_URL",
+    "ban":"INLINE_THUMB_BAN_URL",
+    "game": "INLINE_THUMB_GAME_URL",
+    "profile": "INLINE_THUMB_PROFILE_URL",
+    "stats": "INLINE_THUMB_STATS_URL",
+    "work": "INLINE_THUMB_WORK_URL",
+    "credit": "INLINE_THUMB_CREDIT_URL",
+}
+
+def _normalize_github_url(url: str) -> str:
+    """
+    Поддерживаем:
+    1) https://raw.githubusercontent.com/user/repo/branch/path.png
+    2) https://github.com/user/repo/blob/branch/path.png  -> raw
+    3) ...?raw=true -> игнорируем query, чтобы raw не ломался
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+
+    # убираем query (?raw=true и т.п.), иначе в raw получится битый путь
+    url = url.split("?", 1)[0].strip()
+
+    if "raw.githubusercontent.com/" in url:
+        return url
+
+    m = re.match(r"^https?://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)$", url)
+    if m:
+        user, repo, branch, path = m.group(1), m.group(2), m.group(3), m.group(4)
+        return f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}"
+
+    return url
+
+def _cfg_get(name: str) -> str:
+    """env -> config_local.py -> ''"""
+    v = (os.environ.get(name) or "").strip()
+    if v:
+        return v
+    try:
+        import config_local  # type: ignore
+        v = str(getattr(config_local, name, "") or "").strip()
+        return v
+    except Exception:
+        return ""
+
+def get_inline_thumb_url(key: str) -> str:
+    key = (key or "").strip().lower()
+    if not key:
+        return ""
+
+    if key in _INLINE_THUMB_URL_CACHE:
+        return _INLINE_THUMB_URL_CACHE.get(key, "") or ""
+
+    varname = _INLINE_THUMB_VARNAMES.get(key, "")
+    if not varname:
+        _INLINE_THUMB_URL_CACHE[key] = ""
+        return ""
+
+    url = _cfg_get(varname)
+    url = _normalize_github_url(url)
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        url = ""
+
+    _INLINE_THUMB_URL_CACHE[key] = url
+    return url
+
 @bot.inline_handler(func=lambda q: True)
 def on_inline(q: InlineQuery):
     uid = q.from_user.id
     username = getattr(q.from_user, "username", None)
-    upsert_user(uid, username) 
+    upsert_user(uid, username)
+    
+    # Бан (inline)
+    banned, until_ts, reason = get_ban_info(uid)
+    if banned:
+        txt = "Ваш аккаунт заблокирован администратором."
+        if until_ts and int(until_ts) > 0:
+            txt += f"\nДо: <b>{html_escape(_fmt_ts(int(until_ts)))}</b>."
+        if reason:
+            txt += f"\nПричина: <i>{html_escape(reason)}. Куратор вами разочарован.</i>"
+        txt += "\n\nЕсли вы не согласны с решением — /report → Апелляция."
+    
+        results = []
+        results.append(inline_article(
+            "Конец",
+            "Ваша история подошла к концу...",
+            txt,
+            None,
+            thumb_key="ban"
+        ))
+        bot.answer_inline_query(q.id, results, cache_time=0)
+        return
 
     query_text = (q.query or "").strip()
 
@@ -3402,7 +3966,8 @@ def on_inline(q: InlineQuery):
             "Добро пожаловать",
             "",
             "Вам прислал письмо анонимный доброжелатель",
-            kb
+            kb,
+            thumb_key="start"
             ))
         bot.answer_inline_query(q.id, results, cache_time=0)
         return
@@ -3429,7 +3994,8 @@ def on_inline(q: InlineQuery):
             "Начать игру",
             "Сделай свою ставку",
             text,
-            None
+            None,
+            thumb_key="game"
         ))
     elif stake_cents <= 0:
         text = "Мы не работаем в долг. Сделай ставку, введи сумму"
@@ -3437,7 +4003,8 @@ def on_inline(q: InlineQuery):
             "Начать игру",
             "Сделай свою ставку",
             text,
-            None
+            None,
+            thumb_key="game"
         ))
     else:
         kb = InlineKeyboardMarkup()
@@ -3450,6 +4017,10 @@ def on_inline(q: InlineQuery):
                 "Марафон рулетка",
                 callback_data=cb_pack(f"game:start:cross:life:{stake_cents}", uid)
             ))
+            kb.add(InlineKeyboardButton(
+                "Зеро-рулетка",
+                callback_data=cb_pack(f"game:start:zero:life:{stake_cents}", uid)
+            ))
         else:
             kb.add(InlineKeyboardButton(
                 "Слот автомат / Рулетка",
@@ -3458,6 +4029,10 @@ def on_inline(q: InlineQuery):
             kb.add(InlineKeyboardButton(
                 "Марафон рулетка",
                 callback_data=cb_pack(f"game:start:cross:{stake_cents}", uid)
+            ))
+            kb.add(InlineKeyboardButton(
+                "Зеро-рулетка",
+                callback_data=cb_pack(f"game:start:zero:{stake_cents}", uid)
             ))
         if life_flag:
             game_text = (
@@ -3475,7 +4050,8 @@ def on_inline(q: InlineQuery):
             "Начать игру",
             "Выбери игру",
             game_text,
-            kb
+            kb,
+            thumb_key="game"
         ))
 
     # Работа
@@ -3485,7 +4061,8 @@ def on_inline(q: InlineQuery):
             "Работа",
             "Выбрать вакансию и выйти в смену",
             "Вас ожидают.",
-            None
+            None,
+            thumb_key="work"
         ))
     else:
         sh = get_current_shift(uid)
@@ -3504,7 +4081,8 @@ def on_inline(q: InlineQuery):
                 "Работа",
                 "Текущая смена",
                 text,
-                None
+                None,
+                thumb_key="work"
             ))
         else:
             jobs = load_jobs()
@@ -3513,7 +4091,8 @@ def on_inline(q: InlineQuery):
                     "Работа",
                     "Выбрать вакансию и выйти в смену",
                     "Файл jobs.txt пуст или сломан.",
-                    None
+                    None,
+                    thumb_key="work"
                 ))
             else:
                 rows = db_all("SELECT job_key, shifts FROM work_stats WHERE user_id=?", (uid,))
@@ -3555,7 +4134,8 @@ def on_inline(q: InlineQuery):
                     "Работа",
                     "Выбрать вакансию и выйти в смену",
                     text,
-                    kb
+                    kb,
+                    thumb_key="work"
                 ))
 
     # Профиль
@@ -3565,7 +4145,8 @@ def on_inline(q: InlineQuery):
             "Профиль",
             "Основная сводка по вашей деятельности в боте",
             "Вас ожидают.",
-            None
+            None,
+            thumb_key="profile"
         ))
     else:
         uid2, uname, short_name, created_ts, contract_ts, bal, gift, demon = u
@@ -3601,7 +4182,8 @@ def on_inline(q: InlineQuery):
             "Профиль",
             "Основная сводка по вашей деятельности в боте",
             text,
-            kb
+            kb,
+            thumb_key="profile"
         ))
 
     # Кредит
@@ -3654,7 +4236,8 @@ def on_inline(q: InlineQuery):
             "Кредит",
             "Оформить кредит",
             text,
-            kb
+            kb,
+            thumb_key="credit"
         ))
     except Exception:
         pass
@@ -3663,25 +4246,28 @@ def on_inline(q: InlineQuery):
     cur.execute("SELECT user_id FROM users WHERE demon=0")
     all_uids = [r[0] for r in cur.fetchall()]
     all_uids.sort(key=lambda u: top_value_cents(u), reverse=True)
-
+    
     header = "📄<b><u>Статистика</u>\nПо количеству денежного трафика</b>\n\n"
     lines = []
-    top15 = all_uids[:15]
-    for i2, uid_top in enumerate(top15, start=1):
+    topn = all_uids[:STATS_TOP_LIMIT]
+    for i2, uid_top in enumerate(topn, start=1):
         lines.append(format_user_line(uid_top, i2, uid))
-
+    
     if uid in all_uids:
         my_place = all_uids.index(uid) + 1
-        if my_place > 15:
+        if my_place > STATS_TOP_LIMIT:
             lines.append("…")
             lines.append(format_user_line(uid, my_place, uid))
-
+    
     text = header + "\n".join(lines if lines else ["Пусто"])
+    
+    kb = stats_kb(uid, "money")
     results.append(inline_article(
         "Статистика",
-        "Топ 15 игроков с наибольшим доходом",
+        f"Топ {STATS_TOP_LIMIT} по трафику / рабовладельцам",
         text,
-        None
+        kb,
+        thumb_key="stats"
     ))
 
     bot.answer_inline_query(q.id, results, cache_time=0)
@@ -3692,6 +4278,9 @@ def cmd_start(message):
     uid = message.from_user.id
     username = getattr(message.from_user, "username", None)
     upsert_user(uid, username)
+    if is_banned(uid):
+        bot.send_message(message.chat.id, "Очередная рекламная брошура. Вы выкинули письмо...\n\n\n🚫Ваш аккаунт был заблокирован администратором. Если не согласны с решением алминистратора, отправте апелляцию /report")
+        return
 
     parts = message.text.split(maxsplit=1)
     payload = parts[1].strip() if len(parts) > 1 else ""
@@ -3768,7 +4357,7 @@ def on_reg_callbacks(call: CallbackQuery):
                 bot.delete_message(call.message.chat.id, call.message.message_id)
         except Exception:
             pass
-        bot.answer_callback_query(call.id, "Данные удалены.")
+        bot.answer_callback_query(call.id, "Время ещё не пришло...")
         return
 
     if action == "sign":
@@ -3839,6 +4428,51 @@ def format_user_line(uid: int, place: int, highlight_uid: int) -> str:
     uname_part = f" (@{html_escape(uname)})" if uname else ""
     return f"{place}. {name_html}{uname_part} - <b>{money}</b>$"
 
+STATS_TOP_LIMIT = 20
+
+def stats_kb(uid: int, active: str) -> InlineKeyboardMarkup:
+    active = (active or "money").strip()
+    kb = InlineKeyboardMarkup()
+    a1 = "Денежный трафик" if active == "money" else "Денежный трафик"
+    a2 = "Рабовладельцы" if active == "owners" else "Рабовладельцы"
+    kb.row(
+        InlineKeyboardButton(a1, callback_data=cb_pack("stats:top", uid)),
+        InlineKeyboardButton(a2, callback_data=cb_pack("stats:owners", uid)),
+    )
+    return kb
+
+def format_owner_line(owner_id: int, place: int, highlight_uid: int, slaves_cnt: int, earned_cents: int) -> str:
+    r = db_one("SELECT short_name, username FROM users WHERE user_id=?", (int(owner_id),))
+    name = (r[0] if r else None) or "Без имени"
+    uname = (r[1] if r else "") or ""
+
+    name_html = f"<b>{html_escape(name)}</b>"
+    if int(owner_id) == int(highlight_uid):
+        name_html = f"<b><u>{html_escape(name)}</u></b>"
+
+    uname_part = f" (@{html_escape(uname)})" if uname else ""
+    return (
+        f"{place}. {name_html}{uname_part} — рабов: <b>{int(slaves_cnt)}</b> | "
+        f"доход: <b>{cents_to_money_str(int(earned_cents))}</b>$"
+    )
+
+def get_slave_owner_ranking() -> list[tuple[int, int, int]]:
+    """
+    Возвращает список (owner_id, slaves_cnt, earned_cents),
+    сортировка: slaves_cnt desc, earned_cents desc.
+    """
+    rows = db_all("""
+        SELECT owner_id,
+               COUNT(DISTINCT slave_id) AS slaves_cnt,
+               COALESCE(SUM(COALESCE(earned_cents,0)),0) AS earned_cents
+        FROM slavery
+        GROUP BY owner_id
+        HAVING slaves_cnt > 0
+    """, ())
+    out = [(int(r[0]), int(r[1] or 0), int(r[2] or 0)) for r in (rows or [])]
+    out.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    return out
+
 @bot.callback_query_handler(func=lambda c: c.data and (c.data.startswith("stats:") or c.data.startswith("profile:") or c.data.startswith("work:") or c.data.startswith("game:")))
 def on_main_callbacks(call: CallbackQuery):
     base, owner = cb_unpack(call.data)
@@ -3846,6 +4480,10 @@ def on_main_callbacks(call: CallbackQuery):
 
     if owner is not None and clicker != owner:
         bot.answer_callback_query(call.id, "Вы не можете нажать на эту кнопку", show_alert=True)
+        return
+
+    if is_banned(clicker):
+        bot.answer_callback_query(call.id, "Ваш аккаунт заблокирован. Вы больше не принадлежите этому миру.", show_alert=True)
         return
 
     group_key = compute_group_key_from_callback(call)
@@ -3858,21 +4496,50 @@ def on_main_callbacks(call: CallbackQuery):
         cur.execute("SELECT user_id FROM users WHERE demon=0")
         all_uids = [r[0] for r in cur.fetchall()]
         all_uids.sort(key=lambda u: top_value_cents(u), reverse=True)
-
+    
         header = "📄<b><u>Статистика</u>\nПо количеству денежного трафика</b>\n\n"
         lines = []
-        top15 = all_uids[:15]
-        for i, uid in enumerate(top15, start=1):
+        topn = all_uids[:STATS_TOP_LIMIT]
+        for i, uid in enumerate(topn, start=1):
             lines.append(format_user_line(uid, i, clicker))
-
+    
         if clicker in all_uids:
             my_place = all_uids.index(clicker) + 1
-            if my_place > 15:
+            if my_place > STATS_TOP_LIMIT:
                 lines.append("…")
                 lines.append(format_user_line(clicker, my_place, clicker))
-
+    
         text = header + "\n".join(lines if lines else ["Пусто"])
-        edit_inline_or_message(call, text, reply_markup=None, parse_mode="HTML")
+        kb = stats_kb(clicker, "money")
+        edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+    
+    if kind == "stats" and parts[1] == "owners":
+        ranking = get_slave_owner_ranking()
+    
+        header = "📄<b><u>Статистика</u>\nРабовладельцы</b>\n\n"
+        helpline = "\n\nДля более детальной информации по пользователю /rabs"
+        lines = []
+    
+        topn = ranking[:STATS_TOP_LIMIT]
+        for i, (oid, scnt, earned) in enumerate(topn, start=1):
+            lines.append(format_owner_line(oid, i, clicker, scnt, earned))
+    
+        my_place = None
+        for i, (oid, _sc, _er) in enumerate(ranking, start=1):
+            if int(oid) == int(clicker):
+                my_place = i
+                break
+    
+        if my_place is not None and my_place > STATS_TOP_LIMIT:
+            oid, scnt, earned = next((x for x in ranking if int(x[0]) == int(clicker)), (clicker, 0, 0))
+            lines.append("…")
+            lines.append(format_owner_line(oid, int(my_place), clicker, scnt, earned))
+    
+        text = header + "\n".join(lines if lines else ["Пусто"]) + helpline
+        kb = stats_kb(clicker, "owners")
+        edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
         bot.answer_callback_query(call.id)
         return
 
@@ -3922,9 +4589,10 @@ def on_main_callbacks(call: CallbackQuery):
             bot.answer_callback_query(call.id, "Недостаточно прав.", show_alert=True)
             return
 
-        text = (
-            "Список команд модерирования\n"
+        text = ( # админ команды
+            "Список команд модерирования\n\n"
             "☛ профиль /profile\n"
+            "☛ рассылка /remessage\n"
             "Статусы ☚\n"
             "☛ кастомный /addstatus\n"
             "☛ демон /devil\n"
@@ -3933,6 +4601,8 @@ def on_main_callbacks(call: CallbackQuery):
             "Регистрация ☚\n"
             "☛ перерегистрация юзера /reg \n"
             "☛ удаление юзера /del\n"
+            "☛ бан юзера /ban\n"
+            "☛ разбан юзера /ban\n"
             "Редактирование ☚\n"
             "ㅤфинансы ☚\n"
             "ㅤ☛ выдать /finance\n"
@@ -4232,7 +4902,7 @@ def on_main_callbacks(call: CallbackQuery):
         else:
             lines.append("Сумма выкупа: <b>-</b>")
 
-        lines.append(f"Проигрышей жизни: <b>{strikes}</b>/3")
+        lines.append(f"Проигрышей жизни: <b>{strikes}</b>")
         lines.append(f"Шансов поставить жизнь: <b><u>{rem}</u></b>")
         lines.append(f"Чтобы попробовать выкупить свою свободу - команда /buyout")
 
@@ -4376,6 +5046,9 @@ def on_main_callbacks(call: CallbackQuery):
             return
 
         game_key = parts[2] if len(parts) > 2 else "roulette"
+        if game_key == "zero" and getattr(getattr(call, "message", None), "chat", None) and call.message.chat.type == "private":
+            bot.answer_callback_query(call.id, "Зеро-рулетка доступна только в групповых чатах.", show_alert=True)
+            return
         
         stake_kind = "money"
         life_demon_id = 0
@@ -5127,24 +5800,29 @@ def render_lobby(game_id: str) -> Tuple[str, InlineKeyboardMarkup]:
         lines.append(f"• {name}{uname} - {tail}")
 
     left = max(0, int(reg_ends_ts) - now_ts())
-    game_title = "⟢♣♦ Рулетка ♥♠⟣" if game_type != "cross" else "⟢♣♦ Марафон рулетка ♥♠⟣"
+    if game_type == "cross":
+        game_title = "⟢♣♦ Марафон рулетка ♥♠⟣"
+    elif game_type == "zero":
+        game_title = "⟢♣♦ Зеро-рулетка ♥♠⟣"
+    else:
+        game_title = "⟢♣♦ Рулетка ♥♠⟣"
+    
     stake_line = f"Текущая ставка: <b>{cents_to_money_str(int(stake_cents))}</b>$"
     if stake_kind == "life_demon":
         stake_line = (
             f"Текущая ставка: <b>{cents_to_money_str(int(stake_cents))}</b>$"
         )
-
+    
+    max_players = 2 if stake_kind == "life_demon" else (4 if game_type == "zero" else (5 if game_type in ("roulette", "cross") else len(players)))
     text = (
         f"Игра выбрана: <b>{game_title}</b>\n"
         f"{stake_line}\n\n"
-        "Игроки, учавствующие в игре:\n"
+        f"Участники {len(players)}/{int(max_players)}:\n"
         + "\n".join(lines if lines else ["• (пусто)"])
         + f"\n\nВремя регистрации: {left} секунд"
     )
-
     kb = InlineKeyboardMarkup()
-    max_players = 2 if stake_kind == "life_demon" else (5 if game_type in ("roulette", "cross") else None)
-    if max_players is None or len(players) < int(max_players):
+    if len(players) < int(max_players):
         kb.add(InlineKeyboardButton("Присоединиться к игре", callback_data=f"game:join:{game_id}"))
 
     for puid in pending_uids:
@@ -5230,6 +5908,33 @@ def end_lobby_if_needed(game_id: str):
         kb.add(InlineKeyboardButton(f"Ход {cname}", callback_data=cb_pack(f"turn:begin:{game_id}", int(creator_id))))
         edit_game_message(game_id, text, reply_markup=kb, parse_mode="HTML")
         return
+    
+    if game_type == "zero":
+        db_exec(
+            "UPDATE games SET state='playing', turn_index=0 WHERE game_id=?",
+            (game_id,),
+            commit=True,
+        )
+        shop_bind_players_for_game(game_id)
+        try:
+            zero_init_game(game_id)
+        except Exception:
+            pass
+    
+        order = turn_order_get(game_id)
+        first_uid = order[0] if order else int(creator_id)
+        fu = get_user(first_uid)
+        first_name = fu[2] if fu and fu[2] else "Игрок"
+    
+        text = (
+            "Выбор сохранён.\n"
+            f"⛂⛁ Цена фишки: <b>{cents_to_money_str(int(stake_cents))}</b>$\n"
+            "Приятной игры."
+        )
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton(f"Ход {first_name}", callback_data=cb_pack(f"zero:begin:{game_id}", first_uid)))
+        edit_game_message(game_id, text, reply_markup=kb, parse_mode="HTML")
+        return
 
     db_exec("UPDATE games SET state='choose_format' WHERE game_id=?", (game_id,), commit=True)
     text = (
@@ -5244,7 +5949,893 @@ def end_lobby_if_needed(game_id: str):
     kb.add(InlineKeyboardButton("ĐĒʋÍ£ 3×5", callback_data=cb_pack(f"rfmt:set:{game_id}:3x5", int(creator_id))))
     edit_game_message(game_id, text, reply_markup=kb, parse_mode="HTML")
 
+# TURN ORDER (случайный порядок ходов)
+def game_players_list(game_id: str) -> list:
+    rows = db_all("SELECT user_id FROM game_players WHERE game_id=? ORDER BY rowid", (str(game_id),))
+    return [int(r[0]) for r in rows]
+
+def turn_order_get(game_id: str) -> list:
+    """
+    Возвращает фиксированный (но случайно сгенерированный) порядок игроков для игры.
+    Для марафона (cross) порядок пересоздаётся каждый раунд.
+    """
+    players = game_players_list(game_id)
+    if not players:
+        return []
+
+    rr = db_one("SELECT COALESCE(game_type,'roulette'), COALESCE(cross_round,1) FROM games WHERE game_id=?", (str(game_id),))
+    game_type = (rr[0] if rr else "roulette") or "roulette"
+    cross_round = int((rr[1] if rr else 1) or 1)
+    desired_round = cross_round if str(game_type) == "cross" else 0
+
+    row = db_one("SELECT order_csv, COALESCE(round,0) FROM turn_orders WHERE game_id=?", (str(game_id),))
+    if row:
+        csv = (row[0] or "").strip()
+        stored_round = int((row[1] if row else 0) or 0)
+        order = []
+        if csv:
+            for s in csv.split(","):
+                s = s.strip()
+                if not s:
+                    continue
+                try:
+                    order.append(int(s))
+                except Exception:
+                    pass
+
+        if stored_round == desired_round and len(order) == len(players) and set(order) == set(players):
+            return order
+
+    # Перегенерация
+    order = list(players)
+    random.shuffle(order)
+    db_exec(
+        "INSERT INTO turn_orders (game_id, order_csv, round, updated_ts) VALUES (?,?,?,?) "
+        "ON CONFLICT(game_id) DO UPDATE SET order_csv=excluded.order_csv, round=excluded.round, updated_ts=excluded.updated_ts",
+        (str(game_id), ",".join(str(x) for x in order), int(desired_round), int(now_ts())),
+        commit=True
+    )
+    return order
+
+def turn_order_reset(game_id: str):
+    db_exec("DELETE FROM turn_orders WHERE game_id=?", (str(game_id),), commit=True)
+
+# ZERO-ROULETTE
+ZERO_RULES_URL = "https://teletype.in/@vers_octava/zero_roulete_gude" # ссылка
+ZERO_EMPTY = "ㅤㅤ"
+ZERO_RED = { # Цвета чисел
+    1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36
+}
+
+def zero_color(num: int) -> str:
+    """R/B/W (W = зеро)."""
+    num = int(num)
+    if num == 0:
+        return "W"
+    return "R" if num in ZERO_RED else "B"
+
+def zero_num_label(num: int) -> str:
+    num = int(num)
+    if num == 0:
+        return "Зеро⚪"
+    return f"{num}{'🔴' if zero_color(num) == 'R' else '⚫'}"
+
+def zero_code_is_num(code: str) -> bool:
+    return bool(code) and (code == "Z" or code.startswith("N"))
+
+def zero_code_to_num(code: str) -> int:
+    if code == "Z":
+        return 0
+    return int(code[1:])
+
+def zero_code_label(code: str) -> str:
+    if not code:
+        return ""
+    if code == "E":
+        return "Чётное"
+    if code == "O":
+        return "Нечётное"
+    if code == "R":
+        return "Красное"
+    if code == "B":
+        return "Чёрное"
+    if code == "Z":
+        return "Зеро⚪"
+    if code.startswith("N"):
+        try:
+            return zero_num_label(int(code[1:]))
+        except Exception:
+            return code
+    return code
+
+ZERO_SEQ_TIER = [33,16,24,5,10,23,8,30,11,36,13,27]
+ZERO_SEQ_ORPHELINS = [9,31,14,20,1,6,34,17]
+ZERO_SEQ_VOISINS = [22,18,29,7,28,19,4,21,2,25]
+ZERO_SEQ_ZERO_SPIEL = [12,35,3,26,0,32,15]
+
+def zero_seq_match(nums: list, seq: list) -> bool:
+    """nums == contiguous subseq of seq OR reverse(seq)."""
+    n = len(nums)
+    if n <= 0:
+        return False
+    for base in (seq, list(reversed(seq))):
+        for i in range(0, len(base) - n + 1):
+            if base[i:i+n] == nums:
+                return True
+    return False
+
+def zero_get_order(game_id: str) -> list:
+    return turn_order_get(game_id)
+
+def zero_get_turn_uid(game_id: str) -> int:
+    row = db_one("SELECT COALESCE(turn_index,0) FROM games WHERE game_id=?", (str(game_id),))
+    turn_index = int((row[0] if row else 0) or 0)
+    order = turn_order_get(game_id)
+    if not order:
+        return 0
+    return int(order[turn_index % len(order)])
+
+def zero_get_picks(game_id: str, uid: int) -> list:
+    rows = db_all(
+        "SELECT slot, code FROM zero_bets WHERE game_id=? AND user_id=? ORDER BY slot",
+        (game_id, int(uid))
+    )
+    codes = []
+    for _slot, code in rows:
+        codes.append((code or "").strip())
+    return codes
+
+def zero_clear_picks(game_id: str, uid: int):
+    db_exec("DELETE FROM zero_bets WHERE game_id=? AND user_id=?", (game_id, int(uid)), commit=True)
+
+def zero_set_locked(game_id: str, uid: int, locked: bool):
+    db_exec(
+        "INSERT INTO zero_lock (game_id, user_id, locked) VALUES (?,?,?) "
+        "ON CONFLICT(game_id,user_id) DO UPDATE SET locked=excluded.locked",
+        (game_id, int(uid), 1 if locked else 0),
+        commit=True
+    )
+
+def zero_is_locked(game_id: str, uid: int) -> bool:
+    row = db_one("SELECT COALESCE(locked,0) FROM zero_lock WHERE game_id=? AND user_id=?", (game_id, int(uid)))
+    return bool(int((row[0] if row else 0) or 0))
+
+def zero_all_locked(game_id: str) -> bool:
+    order = zero_get_order(game_id)
+    if not order:
+        return False
+    for uid in order:
+        if not zero_is_locked(game_id, uid):
+            return False
+    return True
+
+def zero_ensure_initialized(game_id: str):
+    row = db_one("SELECT 1 FROM zero_state WHERE game_id=?", (game_id,))
+    if not row:
+        zero_init_game(game_id)
+
+def zero_init_game(game_id: str):
+    """Сброс выбора для новой игры/реванша."""
+    order = zero_get_order(game_id)
+
+    db_exec("DELETE FROM zero_bets WHERE game_id=?", (game_id,), commit=True)
+    db_exec("DELETE FROM zero_lock WHERE game_id=?", (game_id,), commit=True)
+    db_exec("DELETE FROM zero_outcomes WHERE game_id=?", (game_id,), commit=True)
+
+    db_exec(
+        "INSERT INTO zero_state (game_id, stage, revealed, gen_csv, gen_ts) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(game_id) DO UPDATE SET stage=excluded.stage, revealed=0, gen_csv='', gen_ts=0",
+        (game_id, "betting", 0, "", 0),
+        commit=True
+    )
+
+    for uid in order:
+        db_exec(
+            "INSERT INTO zero_lock (game_id, user_id, locked) VALUES (?,?,0)",
+            (game_id, int(uid)),
+            commit=True
+        )
+
+def zero_add_pick(game_id: str, uid: int, code: str) -> Tuple[bool, str]:
+    code = (code or "").strip()
+    if not code:
+        return False, "Пустой выбор."
+
+    picks = zero_get_picks(game_id, uid)
+    if len(picks) >= 5:
+        return False, "Максимум 5."
+
+    if code in ("E", "O"):
+        if any(c in ("E", "O") for c in picks):
+            return False, "Можно выбрать только одно: Чётное/Нечётное."
+    if code in ("R", "B"):
+        if any(c in ("R", "B") for c in picks):
+            return False, "Можно выбрать только одно: Красное/Чёрное."
+
+    if code.startswith("N"):
+        try:
+            n = int(code[1:])
+            if n < 1 or n > 36:
+                return False, "Неверное число."
+        except Exception:
+            return False, "Неверное число."
+
+    slot = len(picks)
+    db_exec(
+        "INSERT OR REPLACE INTO zero_bets (game_id, user_id, slot, code) VALUES (?,?,?,?)",
+        (game_id, int(uid), int(slot), code),
+        commit=True
+    )
+    return True, ""
+
+def zero_parse_gen(game_id: str) -> list:
+    row = db_one("SELECT COALESCE(gen_csv,'') FROM zero_state WHERE game_id=?", (game_id,))
+    csv = (row[0] if row else "") or ""
+    out = []
+    for part in csv.split(","):
+        part = part.strip()
+        if part == "":
+            continue
+        try:
+            out.append(int(part))
+        except Exception:
+            pass
+    return out
+
+def zero_format_cells(codes: list, fill_to: int = 5) -> str:
+    parts = []
+    for i in range(fill_to):
+        if i < len(codes) and codes[i]:
+            parts.append(f"[{zero_code_label(codes[i])}]")
+        else:
+            parts.append(f"[{ZERO_EMPTY}]")
+    return "".join(parts)
+
+def zero_format_gen_row(gen_nums: list, revealed: int) -> str:
+    parts = []
+    for i in range(5):
+        if i < revealed and i < len(gen_nums):
+            parts.append(f"[{zero_num_label(gen_nums[i])}]")
+        else:
+            parts.append(f"[{ZERO_EMPTY}]")
+    return "".join(parts)
+
+def zero_render_screen(game_id: str) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    g = db_one(
+        "SELECT stake_cents, COALESCE(stake_kind,'money'), COALESCE(turn_index,0), COALESCE(state,'') "
+        "FROM games WHERE game_id=?",
+        (game_id,)
+    )
+    if not g:
+        return "Игра не найдена.", None
+    stake_cents, stake_kind, turn_index, gstate = int(g[0] or 0), (g[1] or "money"), int(g[2] or 0), (g[3] or "")
+
+    z = db_one("SELECT COALESCE(stage,'betting'), COALESCE(revealed,0) FROM zero_state WHERE game_id=?", (game_id,))
+    stage = (z[0] if z else "betting") or "betting"
+    revealed = int((z[1] if z else 0) or 0)
+
+    order = zero_get_order(game_id)
+    if not order:
+        return "Нет игроков.", None
+
+    active_uid = int(order[int(turn_index) % len(order)])
+
+    lines = ["<b>⟢♣♦ Зеро-рулетка ♥♠⟣</b>", ""]
+    if ZERO_RULES_URL:
+        lines.append(f'<a href="{html_escape(ZERO_RULES_URL)}">☙ Правила игры ❧</a>')
+    else:
+        lines.append("☙ Правила игры ❧")
+    lines.append(f"⛂⛁ Цена фишки: <b>{cents_to_money_str(stake_cents)}</b>$")
+    lines.append("Игроки:")
+
+    for uid in order:
+        u = get_user(uid)
+        name = u[2] if u and u[2] else "Игрок"
+        uname = u[1] if u and u[1] else ""
+        name_html = f"<b>{html_escape(name)}</b>"
+        if stage == "betting" and uid == active_uid:
+            name_html = f"<b>Ход <u>{html_escape(name)}</u></b>"
+        tail = f" (@{html_escape(uname)})" if uname else ""
+        picks = zero_get_picks(game_id, uid)
+    
+        lines.append(f"{name_html}{tail}")
+    
+        if stage == "betting" and uid == active_uid:
+            a = shop_get_active_for_game(int(uid), str(game_id))
+            allowed = shop_allowed_items_for_game_type("zero")
+            a = {k: v for k, v in (a or {}).items() if k in allowed}
+            bl = render_zero_boosts_inline(a)
+            if bl:
+                lines.append(bl)
+    
+        lines.append(zero_format_cells(picks, 5))
+
+    if stage == "reveal":
+        gen_nums = zero_parse_gen(game_id)
+        lines.append("")
+        lines.append("Выпавшие на рулетке значения:")
+        lines.append(zero_format_gen_row(gen_nums, revealed))
+    else:
+        lines.append("")
+        lines.append("Сделайте свою ставку:")
+
+    kb = None
+    if gstate == "playing" and stage == "betting":
+        if not zero_is_locked(game_id, active_uid):
+            kb = zero_build_keyboard(game_id, active_uid)
+
+    return "\n".join(lines), kb
+
+def zero_build_keyboard(game_id: str, active_uid: int) -> InlineKeyboardMarkup:
+    picks = zero_get_picks(game_id, active_uid)
+    kb = InlineKeyboardMarkup(row_width=8)
+
+    def add_row(nums):
+        row = []
+        for n in nums:
+            if n == 0:
+                txt = "⚪ℤ𝕖𝕣𝕠"
+                code = "Z"
+            else:
+                txt = zero_num_label(n)
+                code = f"N{n}"
+            row.append(InlineKeyboardButton(txt, callback_data=cb_pack(f"zero:pick:{game_id}:{code}", active_uid)))
+        kb.row(*row)
+
+    add_row(list(range(1, 9)))
+    add_row(list(range(9, 17)))
+    add_row(list(range(17, 25)))
+    add_row(list(range(25, 33)))
+    add_row([33, 34, 35, 36, 0])
+
+    kb.row(
+        InlineKeyboardButton("𝔼𝕍𝔼ℕ", callback_data=cb_pack(f"zero:pick:{game_id}:E", active_uid)),
+        InlineKeyboardButton("𝕆𝔻𝔻", callback_data=cb_pack(f"zero:pick:{game_id}:O", active_uid)),
+    )
+    kb.row(
+        InlineKeyboardButton("🟥🟥", callback_data=cb_pack(f"zero:pick:{game_id}:R", active_uid)),
+        InlineKeyboardButton("⬛⬛", callback_data=cb_pack(f"zero:pick:{game_id}:B", active_uid)),
+    )
+
+    if len(picks) > 0:
+        if len(picks) >= 5:
+            kb.row(
+                InlineKeyboardButton("Ставка", callback_data=cb_pack(f"zero:lock:{game_id}", active_uid)),
+                InlineKeyboardButton("Отменить выбор", callback_data=cb_pack(f"zero:cancel:{game_id}", active_uid)),
+            )
+        else:
+            kb.row(
+                InlineKeyboardButton("Отменить выбор", callback_data=cb_pack(f"zero:cancel:{game_id}", active_uid))
+            )
+
+    return kb
+
+def zero_compute_combo(picks: list, gen_nums: list) -> Tuple[str, int]:
+    slots = []
+    for code in picks[:5]:
+        if zero_code_is_num(code):
+            n = zero_code_to_num(code)
+            slots.append(n if n in gen_nums else None)
+        else:
+            slots.append(None)
+
+    best = ("", 1)
+
+    def consider(name: str, mult: int):
+        nonlocal best
+        mult = int(mult)
+        if mult > best[1]:
+            best = (name, mult)
+
+    i = 0
+    while i < len(slots):
+        if slots[i] is None:
+            i += 1
+            continue
+        j = i
+        seg = []
+        while j < len(slots) and slots[j] is not None:
+            seg.append(int(slots[j]))
+            j += 1
+
+        L = len(seg)
+
+        if L >= 3:
+            ok = True
+            for k in range(1, L):
+                if abs(seg[k] - seg[k-1]) != 1:
+                    ok = False
+                    break
+            if ok:
+                consider("Strit", 2 if L == 3 else (3 if L == 4 else 5))
+
+            ok = True
+            if any(x == 0 for x in seg):
+                ok = False
+            else:
+                c0 = zero_color(seg[0])
+                for k in range(1, L):
+                    if abs(seg[k] - seg[k-1]) != 2 or zero_color(seg[k]) != c0:
+                        ok = False
+                        break
+            if ok:
+                consider("Flash", 2 if L == 3 else (3 if L == 4 else 5))
+
+        if L >= 4:
+            if zero_seq_match(seg, ZERO_SEQ_TIER):
+                consider("Tier", 2 if L == 4 else 3)
+            if zero_seq_match(seg, ZERO_SEQ_ORPHELINS):
+                consider("Orphelins", 2 if L == 4 else 3)
+            if zero_seq_match(seg, ZERO_SEQ_VOISINS):
+                consider("Voisins Du Zero", 2 if L == 4 else 3)
+            if zero_seq_match(seg, ZERO_SEQ_ZERO_SPIEL):
+                if seg and seg[0] == 0:
+                    consider("Zero Spiel", 3 if L == 4 else 5)
+                else:
+                    consider("Zero Spiel", 2 if L == 4 else 3)
+
+        i = j
+
+    return best[0], best[1]
+
+def zero_compute_delta(picks: list, gen_nums: list, stake_cents: int) -> Tuple[int, str, int]:
+    stake_cents = int(stake_cents or 0)
+
+    nums_only = [zero_code_to_num(c) for c in picks if zero_code_is_num(c)]
+    special_zero = (len(nums_only) > 0 and set(nums_only) == {0})
+
+    if special_zero:
+        if 0 in gen_nums:
+            return stake_cents * 10, "", 1
+        return -stake_cents * 5, "", 1
+
+    delta = 0
+    even_cnt = sum(1 for n in gen_nums if n != 0 and (n % 2 == 0))
+    odd_cnt = sum(1 for n in gen_nums if n != 0 and (n % 2 == 1))
+    red_cnt = sum(1 for n in gen_nums if zero_color(n) == "R")
+    black_cnt = sum(1 for n in gen_nums if zero_color(n) == "B")
+
+    for code in picks[:5]:
+        if zero_code_is_num(code):
+            n = zero_code_to_num(code)
+            delta += (stake_cents if n in gen_nums else -stake_cents)
+            continue
+
+        if code in ("E", "O") and even_cnt != odd_cnt:
+            if code == "E":
+                if even_cnt > odd_cnt:
+                    delta += (stake_cents * even_cnt + 1) // 2
+                else:
+                    delta -= (stake_cents * odd_cnt * 3 + 1) // 2
+            else:
+                if odd_cnt > even_cnt:
+                    delta += (stake_cents * odd_cnt + 1) // 2
+                else:
+                    delta -= (stake_cents * even_cnt * 3 + 1) // 2
+            continue
+
+        if code in ("R", "B") and red_cnt != black_cnt:
+            if code == "R":
+                if red_cnt > black_cnt:
+                    delta += (stake_cents * red_cnt + 1) // 2
+                else:
+                    delta -= (stake_cents * black_cnt * 3 + 1) // 2
+            else:
+                if black_cnt > red_cnt:
+                    delta += (stake_cents * black_cnt + 1) // 2
+                else:
+                    delta -= (stake_cents * red_cnt * 3 + 1) // 2
+            continue
+
+    combo_name, mult = zero_compute_combo(picks, gen_nums)
+    if mult > 1:
+        delta = int(delta) * int(mult)
+
+    return int(delta), combo_name, int(mult)
+
+# ZERO-ROULETTE: генерация с учётом зеро-фишек
+ZERO_LUCKY_PROC_PCT = 25        # шанс срабатывания удачной фишки
+ZERO_COLOR_BONUS_PCT = 5        # +% к весам (за каждую активную фишку)
+
+def _weighted_sample_unique(pool: list, weight_fn, k: int) -> list:
+    pool = list(pool)
+    out = []
+    for _ in range(int(k)):
+        if not pool:
+            break
+        weights = []
+        for x in pool:
+            try:
+                w = float(weight_fn(x))
+            except Exception:
+                w = 0.0
+            if w <= 0:
+                w = 0.0
+            weights.append(w)
+        total = sum(weights)
+        if total <= 0:
+            idx = random.randrange(len(pool))
+        else:
+            r = random.random() * total
+            s = 0.0
+            idx = 0
+            for i, w in enumerate(weights):
+                s += w
+                if r <= s:
+                    idx = i
+                    break
+        out.append(pool.pop(idx))
+    return out
+
+def _zero_picks_nums(picks: list) -> list:
+    nums = []
+    for code in (picks or []):
+        if zero_code_is_num(code):
+            try:
+                nums.append(int(zero_code_to_num(code)))
+            except Exception:
+                pass
+    return nums
+
+def zero_generate_numbers(game_id: str) -> list:
+    """Генерация 5 уникальных чисел 0..36 с учётом зеро-фишек."""
+    stake_row = db_one("SELECT stake_cents FROM games WHERE game_id=?", (str(game_id),))
+    stake_cents = int((stake_row[0] if stake_row else 0) or 0)
+
+    order = turn_order_get(game_id)
+    if not order:
+        return random.sample(list(range(0, 37)), 5)
+
+    # Считаем активные фишки игроков (влияют на ОБЩУЮ генерацию)
+    red_cnt = 0
+    black_cnt = 0
+    lucky_users = []
+    for uid in order:
+        a = shop_get_active_for_game(int(uid), str(game_id))
+        if a.get("red_chip", 0) > 0:
+            red_cnt += 1
+        if a.get("black_chip", 0) > 0:
+            black_cnt += 1
+        if a.get("lucky_chip", 0) > 0:
+            lucky_users.append(int(uid))
+
+    red_mul = 1.0 + (ZERO_COLOR_BONUS_PCT / 100.0) * red_cnt
+    black_mul = 1.0 + (ZERO_COLOR_BONUS_PCT / 100.0) * black_cnt
+
+    def w(n: int) -> float:
+        n = int(n)
+        if n == 0:
+            return 1.0
+        return red_mul if zero_color(n) == "R" else black_mul
+
+    gen = _weighted_sample_unique(list(range(0, 37)), w, 5)
+
+    # Удачная фишка: с шансом 25% обеспечиваем минимум 2 удачных ставки (по числам)
+    if lucky_users:
+        random.shuffle(lucky_users)
+        gen_set = set(gen)
+
+        for uid in lucky_users:
+            if random.randint(1, 100) > ZERO_LUCKY_PROC_PCT:
+                continue
+
+            picks = zero_get_picks(game_id, uid)
+            nums = _zero_picks_nums(picks)
+            if not nums:
+                maybe_make_slave_by_shop_trigger(uid, max(0, stake_cents * 2), game_id)
+                continue
+
+            hits = sum(1 for n in nums if n in gen_set)
+            if hits < 2:
+                from collections import Counter
+                cnt = Counter(nums)
+
+                cand = [n for n in cnt.keys() if n not in gen_set]
+                cand.sort(key=lambda n: cnt[n], reverse=True)
+
+                to_put = []
+                for n in cand:
+                    if hits >= 2:
+                        break
+                    to_put.append(int(n))
+                    hits += int(cnt[n])
+
+                for n in to_put:
+                    if n in gen_set:
+                        continue
+                    idx = random.randrange(len(gen))
+                    for _ in range(10):
+                        if gen[idx] != n and gen[idx] not in to_put:
+                            break
+                        idx = random.randrange(len(gen))
+                    gen_set.discard(gen[idx])
+                    gen[idx] = int(n)
+                    gen_set.add(int(n))
+
+            maybe_make_slave_by_shop_trigger(uid, max(0, stake_cents * 2), game_id)
+
+    return gen
+
+def zero_start_reveal(game_id: str):
+    gen = zero_generate_numbers(game_id)
+    csv = ",".join(str(x) for x in gen)
+
+    db_exec(
+        "UPDATE zero_state SET stage='reveal', revealed=0, gen_csv=?, gen_ts=? WHERE game_id=?",
+        (csv, now_ts(), game_id),
+        commit=True
+    )
+
+    text, _kb = zero_render_screen(game_id)
+    edit_game_message(game_id, text, reply_markup=None, parse_mode="HTML")
+
+    zero_schedule_reveal(game_id, 1)
+
+def zero_schedule_reveal(game_id: str, revealed: int):
+    def _tick():
+        try:
+            z = db_one("SELECT COALESCE(stage,'') FROM zero_state WHERE game_id=?", (game_id,))
+            if not z or (z[0] or "") != "reveal":
+                return
+
+            db_exec(
+                "UPDATE zero_state SET revealed=? WHERE game_id=?",
+                (int(revealed), game_id),
+                commit=True
+            )
+
+            text, _kb = zero_render_screen(game_id)
+            edit_game_message(game_id, text, reply_markup=None, parse_mode="HTML")
+
+            if int(revealed) < 5:
+                zero_schedule_reveal(game_id, int(revealed) + 1)
+            else:
+                zero_finish_game(game_id)
+        except Exception:
+            pass
+
+    t = threading.Timer(2.0, _tick)
+    t.daemon = True
+    t.start()
+
+def zero_finish_game(game_id: str):
+    g = db_one("SELECT stake_cents, COALESCE(game_type,'roulette'), COALESCE(state,'') FROM games WHERE game_id=?", (game_id,))
+    if not g:
+        return
+    stake_cents = int(g[0] or 0)
+    game_type = (g[1] or "roulette")
+    if game_type != "zero":
+        return
+
+    gen_nums = zero_parse_gen(game_id)
+    order = zero_get_order(game_id)
+    if not order:
+        return
+
+    for uid in order:
+        picks = zero_get_picks(game_id, uid)
+        delta, combo_name, mult = zero_compute_delta(picks, gen_nums, stake_cents)
+
+        active = shop_get_active_for_game(uid, game_id)
+
+        insured = (active.get("insurance", 0) > 0) or (active.get("paket", 0) > 0)
+        if insured and int(delta) < 0:
+            protected_amt = abs(int(delta))
+            if active.get("paket", 0) > 0:
+                shop_mark_used(uid, game_id, "paket")
+                delta = protected_amt
+            else:
+                shop_mark_used(uid, game_id, "insurance")
+                delta = 0
+            maybe_make_slave_by_shop_trigger(uid, protected_amt, game_id)
+
+        u = get_user(uid)
+        is_demon = (u and int(u[7] or 0) == 1)
+        if not is_demon:
+            if delta > 0:
+                kept = apply_slave_cut(uid, int(delta), reason="zero")
+                add_balance(uid, kept)
+            else:
+                add_balance(uid, int(delta))
+
+        db_exec(
+            "INSERT INTO game_results (game_id, user_id, delta_cents, finished) "
+            "VALUES (?,?,?,1) "
+            "ON CONFLICT(game_id,user_id) DO UPDATE SET delta_cents=excluded.delta_cents, finished=1",
+            (game_id, int(uid), int(delta)),
+            commit=True
+        )
+
+        db_exec(
+            "INSERT INTO zero_outcomes (game_id, user_id, combo, mult) VALUES (?,?,?,?) "
+            "ON CONFLICT(game_id,user_id) DO UPDATE SET combo=excluded.combo, mult=excluded.mult",
+            (game_id, int(uid), combo_name or "", float(mult)),
+            commit=True
+        )
+
+        db_exec("INSERT OR IGNORE INTO game_stats (user_id) VALUES (?)", (int(uid),), commit=True)
+        if int(delta) >= 0:
+            db_exec(
+                "UPDATE game_stats SET games_total=games_total+1, wins=wins+1, max_win_cents=MAX(max_win_cents, ?) WHERE user_id=?",
+                (int(delta), int(uid)),
+                commit=True
+            )
+        else:
+            db_exec(
+                "UPDATE game_stats SET games_total=games_total+1, losses=losses+1, max_lose_cents=MAX(max_lose_cents, ?) WHERE user_id=?",
+                (int(abs(int(delta))), int(uid)),
+                commit=True
+            )
+        bump_game_type_stat(int(uid), "zero")
+
+    db_exec("UPDATE games SET state='finished' WHERE game_id=?", (game_id,), commit=True)
+
+    try:
+        for pid in set(order):
+            shop_tick_after_game(int(pid), game_id)
+    except Exception:
+        pass
+
+    apply_demon_life_settlement(game_id)
+    update_demon_streak_after_game(game_id)
+    emancipate_slaves_after_game(game_id)
+
+    creator_row = db_one("SELECT creator_id FROM games WHERE game_id=?", (game_id,))
+    creator_id = int((creator_row[0] if creator_row else 0) or 0)
+
+    totals_text, totals_kb = render_game_totals(game_id, creator_id)
+    edit_game_message(game_id, totals_text, reply_markup=totals_kb, parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("zero:"))
+def on_zero_callbacks(call: CallbackQuery):
+    base, owner = cb_unpack(call.data)
+    clicker = call.from_user.id
+
+    if owner is not None and clicker != owner:
+        bot.answer_callback_query(call.id, "Сейчас не твой ход.", show_alert=True)
+        return
+
+    parts = base.split(":")
+    if len(parts) < 3:
+        bot.answer_callback_query(call.id)
+        return
+
+    action = parts[1]
+    game_id = parts[2]
+
+    g = db_one("SELECT COALESCE(state,''), COALESCE(game_type,'roulette') FROM games WHERE game_id=?", (game_id,))
+    if not g:
+        bot.answer_callback_query(call.id, "Игра не найдена.", show_alert=True)
+        return
+    state, game_type = (g[0] or ""), (g[1] or "roulette")
+    if game_type != "zero":
+        bot.answer_callback_query(call.id, "Это не зеро-рулетка.", show_alert=True)
+        return
+    if state != "playing":
+        bot.answer_callback_query(call.id, "Сейчас нельзя ходить.", show_alert=True)
+        return
+
+    zero_ensure_initialized(game_id)
+    current_uid = zero_get_turn_uid(game_id)
+    if int(clicker) != int(current_uid):
+        bot.answer_callback_query(call.id, "Сейчас ход другого игрока.", show_alert=True)
+        return
+    if zero_is_locked(game_id, clicker):
+        bot.answer_callback_query(call.id, "Вы уже сохранили ставку.", show_alert=True)
+        return
+
+    if action == "begin":
+        text, kb = zero_render_screen(game_id)
+        edit_zero_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+
+    if action == "cancel":
+        zero_clear_picks(game_id, clicker)
+        text, kb = zero_render_screen(game_id)
+        edit_zero_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+
+    if action == "pick":
+        if len(parts) < 4:
+            bot.answer_callback_query(call.id)
+            return
+        code = parts[3]
+        ok, err = zero_add_pick(game_id, clicker, code)
+        if not ok:
+            bot.answer_callback_query(call.id, err, show_alert=True)
+            return
+        text, kb = zero_render_screen(game_id)
+        edit_zero_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+
+    if action == "lock":
+        picks = zero_get_picks(game_id, clicker)
+        if len(picks) < 5:
+            bot.answer_callback_query(call.id, "Нужно заполнить все 5 ячеек.", show_alert=True)
+            return
+
+        zero_set_locked(game_id, clicker, True)
+
+        if zero_all_locked(game_id):
+            bot.answer_callback_query(call.id)
+            try:
+                zero_start_reveal(game_id)
+            except Exception:
+                pass
+            return
+
+        row = db_one("SELECT COALESCE(turn_index,0) FROM games WHERE game_id=?", (game_id,))
+        turn_index = int((row[0] if row else 0) or 0)
+        order = zero_get_order(game_id)
+        next_index = (turn_index + 1) % len(order) if order else 0
+        db_exec("UPDATE games SET turn_index=? WHERE game_id=?", (int(next_index), game_id), commit=True)
+
+        text, kb = zero_render_screen(game_id)
+        edit_zero_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+
+# Итоги игры
 def build_totals_block(game_id: str, creator_id: int) -> str:
+    gt = db_one("SELECT COALESCE(game_type,'roulette') FROM games WHERE game_id=?", (game_id,))
+    game_type = (gt[0] if gt else "roulette") or "roulette"
+
+    if game_type == "zero":
+        gen_nums = zero_parse_gen(game_id)
+        gen_row = zero_format_gen_row(gen_nums, 5) if gen_nums else ""
+
+        order = zero_get_order(game_id)
+
+        rows = db_all("""
+            SELECT gp.user_id, COALESCE(gr.delta_cents, 0) AS delta
+            FROM game_players gp
+            LEFT JOIN game_results gr
+              ON gr.game_id = gp.game_id AND gr.user_id = gp.user_id
+            WHERE gp.game_id=?
+        """, (game_id,))
+        delta_map = {int(uid): int(delta or 0) for (uid, delta) in rows}
+
+        lines = ["<b>⟢♣♦ Зеро-рулетка ♥♠⟣</b>"]
+        if gen_row:
+            lines.append("")
+            lines.append("Выпавшие на рулетке значения:")
+            lines.append(gen_row)
+
+        lines.append("")
+        lines.append("⟢♣♦ Итоги игры ♥♠⟣")
+
+        for i, uid in enumerate(order, start=1):
+            u = get_user(uid)
+            name = u[2] if u and u[2] else "Игрок"
+            uname = u[1] if u and u[1] else ""
+            tail = f" (@{html_escape(uname)})" if uname else ""
+            lines.append(f"{i}. <b>{html_escape(name)}</b>{tail}")
+
+            picks = zero_get_picks(game_id, uid)
+            cells = zero_format_cells(picks, 5)
+
+            oc = db_one(
+                "SELECT COALESCE(combo,''), COALESCE(mult,1.0) FROM zero_outcomes WHERE game_id=? AND user_id=?",
+                (game_id, int(uid))
+            )
+            combo = (oc[0] if oc else "") or ""
+            mult = float((oc[1] if oc else 1.0) or 1.0)
+            combo_part = ""
+            if combo and mult > 1.01:
+                combo_part = f" | {html_escape(combo)} ×{int(round(mult))}"
+
+            delta = delta_map.get(int(uid), 0)
+            lines.append(f"{cells}{combo_part} | <b>{cents_to_money_str(int(delta))}</b>$")
+
+        lines.append("")
+        lines.append("Хотите отыграться?")
+        return "\n".join(lines)
+
     cur.execute("""
         SELECT gp.user_id,
                COALESCE(gr.delta_cents, 0) AS delta
@@ -5410,15 +7001,47 @@ def start_rematch_from_votes(call: CallbackQuery, old_game_id: str, yes_set: set
         "Приятной игры."
     )
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(f"Ход {first_name}", callback_data=cb_pack(f"turn:begin:{new_game_id}", first_uid)))
+    cb = f"zero:begin:{new_game_id}" if game_type == "zero" else f"turn:begin:{new_game_id}"
+    kb.add(InlineKeyboardButton(f"Ход {first_name}", callback_data=cb_pack(cb, first_uid)))
 
-    edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
+    if game_type == "zero":
+        edit_zero_message(call, text, reply_markup=kb, parse_mode="HTML", force_media=True)
+    else:
+        edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
+
 
 def edit_game_message(game_id: str, text: str, reply_markup=None, parse_mode="HTML"):
     row = db_one("SELECT origin_chat_id, origin_message_id, origin_inline_id FROM games WHERE game_id=?", (game_id,))
     if not row:
         return
     chat_id, msg_id, inline_id = row
+
+    g = db_one("SELECT COALESCE(game_type,'roulette'), COALESCE(state,'') FROM games WHERE game_id=?", (game_id,))
+    game_type = (g[0] if g else "roulette") or "roulette"
+    state = (g[1] if g else "") or ""
+
+    if game_type == "zero" and state != "lobby" and zero_media_enabled():
+        try:
+            if inline_id:
+                bot.edit_message_caption(
+                    inline_message_id=inline_id,
+                    caption=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup
+                )
+                return
+            if chat_id and msg_id:
+                bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    caption=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup
+                )
+                return
+        except Exception:
+            pass
+
     if inline_id:
         limited_edit_message_text(text=text, inline_id=inline_id, reply_markup=reply_markup, parse_mode=parse_mode)
     elif chat_id and msg_id:
@@ -5492,11 +7115,13 @@ def handle_join(call: CallbackQuery, game_id: str):
         bot.answer_callback_query(call.id, "Ты уже в списке участников.", show_alert=True)
         return
     
-    if stake_kind != "life_demon" and game_type in ("roulette", "cross"):
-        cnt = db_one("SELECT COUNT(*) FROM game_players WHERE game_id=?", (game_id,))
-        if int((cnt[0] if cnt else 0) or 0) >= 5:
-            bot.answer_callback_query(call.id, "Лобби заполнено.", show_alert=True)
-            return
+    if stake_kind != "life_demon":
+        max_players = 4 if game_type == "zero" else (5 if game_type in ("roulette", "cross") else 0)
+        if max_players:
+            cnt = db_one("SELECT COUNT(*) FROM game_players WHERE game_id=?", (game_id,))
+            if int((cnt[0] if cnt else 0) or 0) >= int(max_players):
+                bot.answer_callback_query(call.id, "Лобби заполнено.", show_alert=True)
+                return
 
     u = get_user(uid)
     if not u or not u[2]:
@@ -5624,6 +7249,34 @@ def handle_continue(call: CallbackQuery, game_id: str):
         edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
         bot.answer_callback_query(call.id)
         return
+    
+    if game_type == "zero":
+        cur.execute("SELECT stake_cents FROM games WHERE game_id=?", (game_id,))
+        stake_cents = int((cur.fetchone() or (0,))[0] or 0)
+    
+        cur.execute("UPDATE games SET state='playing', turn_index=0 WHERE game_id=?", (game_id,))
+        conn.commit()
+        shop_bind_players_for_game(game_id)
+        try:
+            zero_init_game(game_id)
+        except Exception:
+            pass
+    
+        order = turn_order_get(game_id)
+        first_uid = order[0] if order else int(creator_id)
+        fu = get_user(first_uid)
+        first_name = fu[2] if fu and fu[2] else "Игрок"
+    
+        text = (
+            "Выбор сохранён.\n"
+            f"⛂⛁ Цена фишки: <b>{cents_to_money_str(int(stake_cents))}</b>$\n"
+            "Приятной игры."
+        )
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton(f"Ход {first_name}", callback_data=cb_pack(f"zero:begin:{game_id}", first_uid)))
+        edit_zero_message(call, text, reply_markup=kb, parse_mode="HTML", force_media=True)
+        bot.answer_callback_query(call.id)
+        return
 
     cur.execute("UPDATE games SET state='choose_format' WHERE game_id=?", (game_id,))
     conn.commit()
@@ -5723,10 +7376,15 @@ def on_rfmt(call: CallbackQuery):
     conn.commit()
     shop_bind_players_for_game(game_id)
 
-    creator_name = get_user(creator_id)[2] if get_user(creator_id) else "Игрок"
+    order = turn_order_get(game_id)
+    first_uid = int(order[0]) if order else int(creator_id)
+    fu = get_user(first_uid)
+    first_name = fu[2] if fu and fu[2] else "Игрок"
+
     text = f"Выбор сохранён.\nСтавка <b>{cents_to_money_str(int(stake_cents))}</b>\nПриятной игры."
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(f"Ход {creator_name}", callback_data=cb_pack(f"turn:begin:{game_id}", creator_id)))
+    kb.add(InlineKeyboardButton(f"Ход {first_name}", callback_data=cb_pack(f"turn:begin:{game_id}", first_uid)))
+
     edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
     bot.answer_callback_query(call.id)
 
@@ -5756,8 +7414,7 @@ def on_turn_begin(call: CallbackQuery):
         bot.answer_callback_query(call.id, "Вы не можете сейчас ходить.", show_alert=True)
         return
 
-    cur.execute("SELECT user_id FROM game_players WHERE game_id=? ORDER BY rowid", (game_id,))
-    order = [r[0] for r in cur.fetchall()]
+    order = turn_order_get(game_id)
     if not order:
         bot.answer_callback_query(call.id, "Нет игроков.", show_alert=True)
         return
@@ -6023,8 +7680,8 @@ def on_spin_pull(call: CallbackQuery):
                         (int(abs(tot)), uid), commit=True
                     )
                 bump_game_type_stat(uid, game_type)
-            
-            order = [r[0] for r in db_all("SELECT user_id FROM game_players WHERE game_id=? ORDER BY rowid", (game_id,))]
+
+            order = turn_order_get(game_id)
             if not order:
                 return
                     
@@ -6069,7 +7726,9 @@ def on_spin_pull(call: CallbackQuery):
                 db_exec("UPDATE games SET cross_round=?, roulette_format=?, turn_index=0 WHERE game_id=?",
                                     (next_round, next_fmt, game_id), commit=True)
                 
-                next_uid = order[0]
+                order = turn_order_get(game_id)
+                next_uid = int(order[0]) if order else int(uid)
+
                 next_user = get_user(next_uid)
                 next_name = next_user[2] if next_user and next_user[2] else "Игрок"
                 kb = InlineKeyboardMarkup()
@@ -6157,13 +7816,13 @@ def on_life_accept(call: CallbackQuery):
 
     _, _, game_id = base.split(":", 2)
 
-    cur.execute("SELECT state, stake_cents, creator_id FROM games WHERE game_id=?", (game_id,))
+    cur.execute("SELECT state, stake_cents, creator_id, COALESCE(game_type,'roulette') FROM games WHERE game_id=?", (game_id,))
     g = cur.fetchone()
     if not g:
         bot.answer_callback_query(call.id, "Игра не найдена.", show_alert=True)
         return
 
-    state, stake_cents, creator_id = g
+    state, stake_cents, creator_id, game_type = g
     stake_cents = int(stake_cents or 0)
     creator_id = int(creator_id or 0)
 
@@ -6208,8 +7867,7 @@ def on_life_accept(call: CallbackQuery):
         cur.execute("UPDATE games SET state='playing' WHERE game_id=?", (game_id,))
         conn.commit()
 
-        cur.execute("SELECT user_id FROM game_players WHERE game_id=? ORDER BY rowid", (game_id,))
-        order = [int(r[0]) for r in cur.fetchall()]
+        order = turn_order_get(game_id)
         if len(order) >= 2:
             first_uid = order[0]
             fu = get_user(first_uid)
@@ -6221,7 +7879,8 @@ def on_life_accept(call: CallbackQuery):
                 "Приятной игры."
             )
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton(f"Ход {first_name}", callback_data=cb_pack(f"turn:begin:{game_id}", first_uid)))
+            cb = f"zero:begin:{game_id}" if game_type == "zero" else f"turn:begin:{game_id}"
+            kb.add(InlineKeyboardButton(f"Ход {first_name}", callback_data=cb_pack(cb, first_uid)))
             edit_game_message(game_id, text, reply_markup=kb, parse_mode="HTML")
 
     try:
@@ -6914,11 +8573,9 @@ def cmd_blockcash(message):
     target_id: Optional[int] = None
     dur_spec = ""
 
-    # /blockcash @username 24h
     if len(parts) >= 2 and (parts[1].startswith("@") or parts[1].isdigit()):
         target_id = resolve_user_id_ref(parts[1].strip())
         dur_spec = parts[2].strip() if len(parts) >= 3 else ""
-    # ответом: /blockcash 24h
     elif message.reply_to_message and len(parts) >= 2:
         target_user = message.reply_to_message.from_user
         target_id = int(target_user.id)
@@ -6942,8 +8599,8 @@ def cmd_blockcash(message):
         bot.reply_to(message, "Неверная длительность.")
         return
 
-    # максимум 30 дней
-    sec = min(sec, 30 * 86400)
+    
+    sec = min(sec, 30 * 86400)# максимум 30 дней
 
     ts = now_ts()
     until_ts = ts + int(sec)
@@ -7074,6 +8731,64 @@ def cmd_udblockcash(message):
     except Exception:
         pass
 
+@bot.message_handler(commands=["remessage"])
+def cmd_remessage(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    if message.chat.type != "private":
+        return
+
+    raw = message.text or ""
+    if "\n" not in raw:
+        bot.reply_to(
+            message,
+            "Использование:\n"
+            "/remessage\n"
+            "<текст рассылки с HTML-разметкой>"
+        )
+        return
+
+    _cmd, body = raw.split("\n", 1)
+    body = (body or "").strip("\n")
+    if not body.strip():
+        bot.reply_to(message, "Текст рассылки пуст.")
+        return
+
+    rows = db_all("SELECT user_id FROM users", ())
+    uids = [int(r[0]) for r in (rows or []) if r and str(r[0]).isdigit()]
+
+    sent = 0
+    failed = 0
+
+    def _parse_retry_after(exc: Exception) -> float:
+        s = str(exc)
+        m = re.search(r"retry after (\d+(?:\.\d+)?)", s, re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                return 0.0
+        return 0.0
+
+    for uid in uids:
+        try:
+            bot.send_message(uid, body, parse_mode="HTML")
+            sent += 1
+        except Exception as e:
+            ra = _parse_retry_after(e)
+            if ra and ra > 0:
+                time.sleep(ra + 0.2)
+                try:
+                    bot.send_message(uid, body, parse_mode="HTML")
+                    sent += 1
+                    continue
+                except Exception:
+                    pass
+            failed += 1
+        time.sleep(0.03)
+
+    bot.reply_to(message, f"Рассылка завершена. Успешно: {sent}, ошибок: {failed}")
+
 @bot.message_handler(commands=["del"])
 def cmd_del(message):
     if message.from_user.id != OWNER_ID:
@@ -7171,6 +8886,108 @@ def cmd_del(message):
 
     bot.reply_to(message, f"Готово. Пользователь @{uname} полностью удалён из базы.")
 
+@bot.message_handler(commands=["ban"])
+def cmd_ban(message):
+    if message.from_user.id != OWNER_ID:
+        return
+
+    raw = message.text or ""
+    lines = raw.splitlines()
+    first_line = (lines[0] if lines else "").strip()
+    reason_nl = "\n".join(lines[1:]).strip()
+
+    parts = first_line.split(maxsplit=3)
+    if len(parts) < 2 or not parts[1].startswith("@"):
+        bot.reply_to(message, "Использование:\n/ban @username [24h|7d|perm]\n<причина с новой строки>")
+        return
+
+    uname = parts[1][1:].strip()
+    tok = parts[2].strip() if len(parts) >= 3 else ""
+    tail_same_line = parts[3].strip() if len(parts) >= 4 else ""
+
+    duration_sec = 0
+    extra_reason = ""
+
+    if tok:
+        dur = parse_duration_to_seconds(tok)
+        if dur is None:
+            duration_sec = 0
+            extra_reason = " ".join([tok, tail_same_line]).strip()
+        else:
+            duration_sec = int(dur or 0)
+            extra_reason = tail_same_line
+
+    reason = reason_nl if reason_nl else extra_reason
+    reason = (reason or "").strip()
+
+    rr = db_one("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (uname,))
+    if not rr:
+        bot.reply_to(message, "Пользователь не найден в базе.")
+        return
+
+    target_id = int(rr[0])
+    if target_id == OWNER_ID:
+        bot.reply_to(message, "Нельзя заблокировать владельца бота.")
+        return
+
+    until_ts = ban_user(target_id, by_id=OWNER_ID, reason=reason, duration_sec=duration_sec)
+
+    try:
+        msg = "Ваш аккаунт заблокирован администратором"
+        if until_ts and int(until_ts) > 0:
+            msg += f" до <b>{html_escape(_fmt_ts(int(until_ts)))}</b>."
+        else:
+            msg += "."
+
+        if reason:
+            msg += f"\nПричина: <i>{html_escape(reason)}</i>"
+
+        msg += "\nЕсли вы не согласны с решением — отправьте апелляцию через /report."
+        bot.send_message(target_id, msg, parse_mode="HTML")
+    except Exception:
+        pass
+
+    if until_ts and int(until_ts) > 0:
+        out = f"Пользователь @{uname} заблокирован до {_fmt_ts(int(until_ts))}"
+    else:
+        out = f"Пользователь @{uname} перманентно заблокирован"
+    if reason:
+        out += f"\nПричина:\n{reason}"
+    bot.reply_to(message, out)
+
+@bot.message_handler(commands=["unban"])
+def cmd_unban(message):
+    if message.from_user.id != OWNER_ID:
+        return
+
+    txt = (message.text or "").strip()
+    m = re.match(r"^/unban\s+@([A-Za-z0-9_]+)(?:\s+([\s\S]+))?$", txt)
+    if not m:
+        bot.reply_to(message, "Использование: /unban @username [причина]")
+        return
+
+    uname = (m.group(1) or "").strip()
+    reason = (m.group(2) or "").strip()
+
+    rr = db_one("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (uname,))
+    if not rr:
+        bot.reply_to(message, "Пользователь не найден в базе.")
+        return
+
+    target_id = int(rr[0])
+    if target_id == OWNER_ID:
+        bot.reply_to(message, "Владелец бота не может быть забанен.")
+        return
+
+    unban_user(target_id, by_id=OWNER_ID, reason=reason)
+
+    try:
+        bot.send_message(target_id, "Ваш аккаунт разблокирован администратором.")
+    except Exception:
+        pass
+
+    bot.reply_to(message, f"Пользователь @{uname} разблокирован.")
+
 # DIFFERENT COMMANDS
 @bot.message_handler(commands=["get"])
 def cmd_get(message):
@@ -7225,6 +9042,10 @@ def cmd_profile(message):
     username = getattr(message.from_user, "username", None)
     upsert_user(uid, username)
 
+    if is_banned(uid):
+        bot.reply_to(message, "У вас нет больше профиля.")
+        return
+    
     u = get_user(uid)
     if not u or not u[2]:
         return
@@ -7245,11 +9066,249 @@ def cmd_profile(message):
     )
     bot.send_message(message.chat.id, text, parse_mode="HTML")
 
+REPORT_CATS = {
+    "bug": "Ошибка бота",
+    "user": "Жалоба на пользователя",
+    "appeal": "Апелляция",
+    "other": "Другое",
+}
+
+@bot.message_handler(commands=["report"])
+def cmd_report(message):
+    if message.chat.type != "private":
+        bot.reply_to(message, "Команда /report доступна только в личных сообщениях.")
+        return
+
+    uid = message.from_user.id
+    upsert_user(uid, getattr(message.from_user, "username", None))
+
+    banned_now = is_banned(uid)
+
+    if (not banned_now) and (not is_registered(uid)):
+        return
+
+    report_clear_state(uid)
+
+    kb = InlineKeyboardMarkup()
+
+    if banned_now:
+        kb.add(InlineKeyboardButton("Апелляция", callback_data=cb_pack("report:cat:appeal", uid)))
+    else:
+        kb.add(InlineKeyboardButton("Ошибка бота", callback_data=cb_pack("report:cat:bug", uid)))
+        kb.add(InlineKeyboardButton("Жалоба на пользователя", callback_data=cb_pack("report:cat:user", uid)))
+        kb.add(InlineKeyboardButton("Апелляция", callback_data=cb_pack("report:cat:appeal", uid)))
+        kb.add(InlineKeyboardButton("Другое", callback_data=cb_pack("report:cat:other", uid)))
+
+    bot.send_message(message.chat.id, "Выберите категорию запроса:", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("report:"))
+def on_report_callbacks(call: CallbackQuery):
+    base, owner = cb_unpack(call.data)
+    clicker = call.from_user.id
+
+    if owner is not None and clicker != owner:
+        bot.answer_callback_query(call.id, "Вы не можете нажать на эту кнопку", show_alert=True)
+        return
+
+    parts = base.split(":")
+    if len(parts) < 3 or parts[1] != "cat":
+        bot.answer_callback_query(call.id)
+        return
+
+    cat = parts[2].strip()
+    if cat not in REPORT_CATS:
+        bot.answer_callback_query(call.id, "Неизвестная категория.", show_alert=True)
+        return
+
+    banned_now = is_banned(clicker)
+    if banned_now and cat != "appeal":
+        bot.answer_callback_query(call.id, "Вам доступна только апелляция.", show_alert=True)
+        return
+
+    report_set_state(clicker, cat, "await_content")
+
+    if cat == "user":
+        text = (
+            "Отправьте одним сообщением:\n"
+            "1-я строка @username нарушителя\n"
+            "со 2-й строки описание (обязательно)\n\n"
+            "Можно прикрепить фото или видео к этому сообщению."
+        )
+    elif cat == "appeal":
+        if banned_now:
+            text = (
+                "Отправьте описание апелляции одним сообщением.\n\n"
+                "Можно прикрепить фото или видео к этому сообщению."
+            )
+        else:
+            text = (
+                "Отправьте одним сообщением:\n"
+                "1-я строка @username (по кому рассматривается апелляция)\n"
+                "со 2-й строки описание (обязательно)\n\n"
+                "Можно прикрепить фото или видео к этому сообщению."
+            )
+    else:
+        text = (
+            "Отправьте описание проблемы одним сообщением.\n\n"
+            "Можно прикрепить фото или видео к этому сообщению."
+        )
+
+    edit_inline_or_message(call, text, reply_markup=None, parse_mode=None)
+    bot.answer_callback_query(call.id)
+
+@bot.message_handler(content_types=["text", "photo", "video"], func=lambda m: m.chat.type == "private")
+def on_report_content(message):
+    uid = message.from_user.id
+    stage, cat = report_get_state(uid)
+    if stage != "await_content" or not cat:
+        return
+
+    upsert_user(uid, getattr(message.from_user, "username", None))
+
+    banned_now = is_banned(uid)
+
+    if banned_now and cat != "appeal":
+        report_clear_state(uid)
+        try:
+            r = db_one("SELECT COALESCE(until_ts,0) FROM bans WHERE user_id=? LIMIT 1", (int(uid),))
+            until_ts = int((r[0] if r else 0) or 0)
+        except Exception:
+            until_ts = 0
+
+        if until_ts > 0:
+            bot.reply_to(
+                message,
+                f"Ваш аккаунт заблокирован администратором до <b>{html_escape(_fmt_ts(int(until_ts)))}</b>.",
+                parse_mode="HTML"
+            )
+        else:
+            bot.reply_to(message, "Ваш аккаунт заблокирован администратором. Используйте /report для подачи апелляции.")
+        return
+
+    raw = ""
+    if message.content_type == "text":
+        raw = (message.text or "").strip()
+    else:
+        raw = (message.caption or "").strip()
+
+    if raw.startswith("/"):
+        bot.reply_to(message, "Заполните форму одним сообщением (текст + опционально фото/видео).")
+        return
+
+    if not raw:
+        bot.reply_to(message, "Пустое сообщение. Пришлите текст описания (и, при желании, фото/видео).")
+        return
+
+    target_un = ""        # для категории "Жалоба на пользователя"
+    appeal_to_un = ""     # для категории "Апелляция"
+    desc = ""
+
+    if cat == "user":
+        lines = raw.splitlines()
+        if not lines or not lines[0].strip().startswith("@"):
+            bot.reply_to(message, "Формат неверный. Первая строка должна быть @username")
+            return
+        target_un = lines[0].strip()
+        desc = "\n".join(lines[1:]).strip()
+        if not desc:
+            bot.reply_to(message, "Добавьте описание проблемы со второй строки. Оно необходимо для выявления проблемы.")
+            return
+
+    elif cat == "appeal" and (not banned_now):
+        lines = raw.splitlines()
+        if not lines or not lines[0].strip().startswith("@"):
+            bot.reply_to(message, "Формат неверный. Первая строка должна быть @username")
+            return
+        appeal_to_un = lines[0].strip()
+        desc = "\n".join(lines[1:]).strip()
+        if not desc:
+            bot.reply_to(message, "Добавьте описание проблемы со второй строки. Оно необходимо для выявления проблемы.")
+            return
+
+    else:
+        desc = raw.strip()
+
+    from_name = message.from_user.first_name or "Пользователь"
+    from_un = getattr(message.from_user, "username", None) or ""
+    from_line = f"{html_escape(from_name)}" + (f" (@{html_escape(from_un)})" if from_un else "")
+    ts_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts()))
+    cat_title = REPORT_CATS.get(cat, cat)
+
+    admin_text = f"Репорт {ts_txt}\nОт {from_line}\nКатегория {cat_title}\n"
+
+    # на кого жалоба
+    if cat == "user":
+        tu = target_un.lstrip("@").strip()
+        rr = db_one("SELECT short_name, username FROM users WHERE username=? COLLATE NOCASE", (tu,))
+        if rr:
+            tname = rr[0] or "Пользователь"
+            tun = rr[1] or tu
+            admin_text += f"На {html_escape(tname)} (@{html_escape(tun)})\n"
+        else:
+            admin_text += f"На @{html_escape(tu)}\n"
+
+    # кому рассматривать апелляцию
+    if cat == "appeal" and appeal_to_un:
+        tu = appeal_to_un.lstrip("@").strip()
+        rr = db_one("SELECT short_name, username FROM users WHERE username=? COLLATE NOCASE", (tu,))
+        if rr:
+            tname = rr[0] or "Пользователь"
+            tun = rr[1] or tu
+            admin_text += f"Для {html_escape(tname)} (@{html_escape(tun)})\n"
+        else:
+            admin_text += f"Для @{html_escape(tu)}\n"
+
+    admin_text += "Описание проблемы:\n"
+    admin_text += f"<i>{html_escape(desc)}</i>"
+
+    if cat == "user":
+        admin_text += "\nБыстрые команды:\n/ban  /del"
+
+    # медиа
+    media_type = None
+    media_file_id = None
+    try:
+        if message.content_type == "photo" and message.photo:
+            media_type = "photo"
+            media_file_id = message.photo[-1].file_id
+        elif message.content_type == "video" and message.video:
+            media_type = "video"
+            media_file_id = message.video.file_id
+    except Exception:
+        media_type = None
+        media_file_id = None
+
+    try:
+        if media_type and media_file_id:
+            if len(admin_text) <= 900:
+                if media_type == "photo":
+                    bot.send_photo(OWNER_ID, media_file_id, caption=admin_text, parse_mode="HTML")
+                else:
+                    bot.send_video(OWNER_ID, media_file_id, caption=admin_text, parse_mode="HTML")
+            else:
+                bot.send_message(OWNER_ID, admin_text, parse_mode="HTML")
+                if media_type == "photo":
+                    bot.send_photo(OWNER_ID, media_file_id)
+                else:
+                    bot.send_video(OWNER_ID, media_file_id)
+        else:
+            bot.send_message(OWNER_ID, admin_text, parse_mode="HTML")
+    except Exception:
+        bot.reply_to(message, "Не удалось отправить репорт. Попробуйте позже.")
+        return
+
+    report_clear_state(uid)
+    bot.reply_to(message, "Репорт отправлен администратору на рассмотрение. Благодарим вас за поддержку проекта!")
+
 @bot.message_handler(commands=["pay"])
 def cmd_pay(message):
     sender_id = int(message.from_user.id)
     sender_un = getattr(message.from_user, "username", None)
     upsert_user(sender_id, sender_un)
+
+    if is_banned(sender_id):
+        bot.reply_to(message, "Вам нечего переводить пользователю.")
+        return
 
     if not is_registered(sender_id):
         return
@@ -7261,6 +9320,10 @@ def cmd_pay(message):
     amount_str: Optional[str] = None
     comment = ""
 
+    if target_id and is_banned(int(target_id)):
+        bot.reply_to(message, "Переводы этому пользователю больше недоступны. Приносим свои извинения.\nСотрудник НПАО \"Greed\"")
+        return
+
     if message.reply_to_message and len(parts) >= 2 and not parts[1].startswith("@"):
         target_user = message.reply_to_message.from_user
         target_id = int(target_user.id)
@@ -7271,7 +9334,7 @@ def cmd_pay(message):
         if len(parts) < 3:
             bot.reply_to(
                 message,
-                "Приветсвуем вас в системе быстрых переводов средств НПАО \"Greed\"\n"
+                "Приветсвуем вас в системе быстрых переводов средств КО НПАО \"Greed\"\n"
                 "Чтобы воспользоваться услугой, введите: /pay @username сумма [комментарий]\n"
                 "Поддержка перевода по NFS! Достаточно ответить на чужое сообщение и ввести: /pay сумма [комментарий]"
             )
@@ -7425,9 +9488,9 @@ def cmd_rabs(message):
 
     head_owner_un = f" (@{html_escape(owner_username)})" if owner_username else ""
     intro = (
-        f"Список рабов пользователя <b>{html_escape(owner_name)}</b>{head_owner_un}\n"
-        "Чтобы приобрести раба, используйте команду /buyrab\n\n"
+        f"Список рабов пользователя <b>{html_escape(owner_name)}</b>{head_owner_un}\n" 
     )
+    intro2 = "\n\nЧтобы приобрести раба, используйте /buyrab"
 
     if not rows:
         bot.send_message(message.chat.id, intro + "Пусто", parse_mode="HTML")
@@ -7454,7 +9517,7 @@ def cmd_rabs(message):
             f"+ <b>{cents_to_money_str(lastp)}</b>$"
         )
 
-    bot.send_message(message.chat.id, intro + "\n".join(lines), parse_mode="HTML")
+    bot.send_message(message.chat.id, intro + "\n".join(lines) + intro2, parse_mode="HTML")
 
 @bot.message_handler(commands=["buyrab"])
 def cmd_buyrab(message):
@@ -7476,7 +9539,7 @@ def cmd_buyrab(message):
         raw = parts[2].replace("$", "").strip()
         custom_total = money_to_cents(raw)
         if custom_total is None or custom_total <= 0:
-            bot.reply_to(message, "Неверная сумма. Пример ввода 15000 или 15000.50")
+            bot.reply_to(message, "Неверный формат суммы. Поддерживаемые форматы 15000 или 15000.50")
             return
 
     rr = db_one(
@@ -7520,7 +9583,7 @@ def cmd_buyrab(message):
         "SELECT 1 FROM buyrab_offers WHERE slave_id=? AND buyer_id=? AND state IN (0,1) LIMIT 1",
         (slave_id, buyer_id),
     ):
-        bot.reply_to(message, "У вас уже есть активная сделка на этого раба. Дождитесь ответа владельцев или отмените прошлую.")
+        bot.reply_to(message, "У вас уже есть активная сделка на этого раба. Дождитесь ответа владельцев или отмените прошлую сделку.")
         return
 
     total_cents = int(custom_total if custom_total is not None else buyout_cents)
@@ -7533,7 +9596,7 @@ def cmd_buyrab(message):
     if buyer_bal < total_cents or buyer_bal < 0:
         bot.reply_to(
             message,
-            f"Недостаточно средств для приобретения. Нужно: {cents_to_money_str(total_cents)}$, на балансе: {cents_to_money_str(buyer_bal)}$.",
+            f"Недостаточно средств для приобретения. Необходимая сумма: {cents_to_money_str(total_cents)}$\nВаш балансе: {cents_to_money_str(buyer_bal)}$.",
         )
         return
 
@@ -7646,7 +9709,7 @@ def cmd_buyout(message):
     owners = get_slave_owners(uid)
     if not owners:
         free_slave_fully(uid, "самовыкуп (владельцы не найдены)")
-        bot.send_message(message.chat.id, "Ты освобождён.", parse_mode="HTML")
+        bot.send_message(message.chat.id, "Ты свободен.", parse_mode="HTML")
         return
 
     total_bp = sum(bp for _oid, bp in owners) or 0
