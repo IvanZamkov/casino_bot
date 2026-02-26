@@ -4602,7 +4602,7 @@ def on_main_callbacks(call: CallbackQuery):
             "☛ перерегистрация юзера /reg \n"
             "☛ удаление юзера /del\n"
             "☛ бан юзера /ban\n"
-            "☛ разбан юзера /ban\n"
+            "☛ разбан юзера /unban\n"
             "Редактирование ☚\n"
             "ㅤфинансы ☚\n"
             "ㅤ☛ выдать /finance\n"
@@ -9156,7 +9156,10 @@ def on_report_callbacks(call: CallbackQuery):
     edit_inline_or_message(call, text, reply_markup=None, parse_mode=None)
     bot.answer_callback_query(call.id)
 
-@bot.message_handler(content_types=["text", "photo", "video"], func=lambda m: m.chat.type == "private")
+@bot.message_handler(
+        content_types=["text", "photo", "video"], 
+        func=lambda m: (m.chat.type == "private" and report_get_state(m.from_user.id)[0] == "await_content")
+)
 def on_report_content(message):
     uid = message.from_user.id
     stage, cat = report_get_state(uid)
