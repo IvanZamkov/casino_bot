@@ -4373,7 +4373,15 @@ def on_reg_callbacks(call: CallbackQuery):
         return
 
 # Name capture 
-@bot.message_handler(func=lambda m: m.chat.type == "private" and m.text and not m.text.startswith("/"))
+@bot.message_handler(func=lambda m: (
+    m.chat.type == "private"
+    and m.text
+    and not m.text.startswith("/")
+    and db_one(
+        "SELECT 1 FROM report_state WHERE user_id=? AND stage='await_content' LIMIT 1",
+        (int(m.from_user.id),),
+    ) is None
+))
 def on_private_text(message):
     uid = message.from_user.id
     username = getattr(message.from_user, "username", None)
