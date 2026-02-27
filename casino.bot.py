@@ -20,6 +20,9 @@ from telebot.types import (
     CallbackQuery,
     InputMediaPhoto,
 )
+import io
+import sys
+import traceback
 
 # CONFIG
 OWNER_ID = int(os.environ.get("OWNER_ID", "7739179390"))
@@ -62,6 +65,65 @@ def load_bot_token() -> str:
 BOT_TOKEN = load_bot_token()
 
 bot = TeleBot(BOT_TOKEN, threaded=True, num_threads=8)
+
+# Коды ошибок 
+_ERROR_REPORT_LAST: dict[str, int] = {}
+ERROR_REPORT_COOLDOWN_SEC = 60
+
+def send_error_report(context: str, exc: Exception | None = None) -> None:
+    try:
+        now = int(time.time())
+        prev = int(_ERROR_REPORT_LAST.get(context, 0) or 0)
+        if (now - prev) < ERROR_REPORT_COOLDOWN_SEC:
+            return
+        _ERROR_REPORT_LAST[context] = now
+
+        if exc is None:
+            tb = traceback.format_exc()
+            if not tb or tb.strip() == "NoneType: None":
+                tb = "".join(traceback.format_stack(limit=40))
+        else:
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        payload = f"[{ts}] {context}\n\n{tb}".encode("utf-8", errors="replace")
+
+        bio = io.BytesIO(payload)
+        bio.name = f"bot_error_{now}.txt"
+
+        bot.send_document(
+            OWNER_ID,
+            bio,
+            caption=f"Ошибка бота: {context}"
+        )
+    except Exception:
+        try:
+            print("send_error_report failed")
+        except Exception:
+            pass
+
+def _thread_excepthook(args):
+    try:
+        text = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        bio = io.BytesIO(text.encode("utf-8", errors="replace"))
+        bio.name = f"thread_error_{int(time.time())}.txt"
+        bot.send_document(OWNER_ID, bio, caption=f"Поток: {getattr(args.thread, 'name', 'thread')}")
+    except Exception:
+        pass
+
+threading.excepthook = _thread_excepthook
+
+def _sys_excepthook(exc_type, exc_value, exc_tb):
+    try:
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        bio = io.BytesIO(text.encode("utf-8", errors="replace"))
+        bio.name = f"fatal_error_{int(time.time())}.txt"
+        bot.send_document(OWNER_ID, bio, caption="Необработанная ошибка")
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _sys_excepthook
 
 # Global edit limiter
 import heapq
@@ -210,8 +272,25 @@ def limited_edit_message_text(*, text: str, reply_markup=None, parse_mode: str =
         except Exception:
             pass
 
-ME = bot.get_me()
-BOT_USERNAME = ME.username
+# Защита бота от падения
+def init_bot_identity():
+    try:
+        me = bot.get_me()
+        return me, (getattr(me, "username", "") or "").strip()
+    except Exception as e:
+        try:
+            print("get_me failed:", repr(e))
+        except Exception:
+            pass
+
+        try:
+            send_error_report("startup:get_me", e)
+        except Exception:
+            pass
+
+        return None, ""
+
+ME, BOT_USERNAME = init_bot_identity()
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 
@@ -563,6 +642,15 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS shop_cooldowns (
     user_id INTEGER PRIMARY KEY,
     next_protect_ts INTEGER NOT NULL DEFAULT 0
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS shop_item_cooldowns (
+    user_id INTEGER NOT NULL,
+    item_key TEXT NOT NULL,
+    next_ts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, item_key)
 )
 """)
 
@@ -1121,7 +1209,7 @@ def credit_amount_ok(uid: int, sum_cents: int) -> Tuple[bool, str]:
 
     if sum_cents < min_c or sum_cents > max_c:
         msg = (
-            f"Превышен лимит суммы кредита: минимум {cents_to_money_str(min_c)}$, максимум {cents_to_money_str(max_c)}$.\n"
+            f"Превышен лимит суммы кредита\n минимум {cents_to_money_str(min_c)}$, максимум {cents_to_money_str(max_c)}$.\n"
             f"Примечание: Лимит растёт каждые {CREDIT_MAX_STEP_WINS} побед в играх (+{CREDIT_MAX_STEP_DOLLARS}$ к максимуму), ваше колличество побед на данный момент: {wins}."
         )
         return False, msg
@@ -1353,8 +1441,8 @@ PAY_FRAUD_WINDOW_SEC = 24 * 3600
 PAY_FRAUD_BLOCK_SEC = 24 * 3600
 
 PAY_FRAUD_BLOCK_TEXT = (
-    "Наши операторы обнаружили подозрительные переводы средств. Дабы уберечь ваши средства, мы блокируем любые переводы вашего счёта на день. Благодарим вас за понимание.\n"
-    "Сотрудник  НПАО \"Greed\""
+    "Наши операторы обнаружили подозрительные переводы средств. Дабы уберечь ваши средства, мы временно блокируем любые переводы с вашего счёта и на ваш счёт на день. Благодарим вас за понимание.\n"
+    "Сотрудник КО НПАО \"G®️eed\""
 )
 
 TRANSFER_BLOCK_LOG_PATH = os.path.join(DATA_DIR, "transfer_blocks.log")
@@ -1705,7 +1793,8 @@ def _mail_letter_text(kind: str, amount_cents: int) -> str:
         dname = (d[2] if d and d[2] else "Демон")
         return (
             "За всё необходимо платить по счетам. Черёд вашего попечителя получить свою долю от ваших побед.\n\n"
-            f"<i>К письму прилагался отчет о вашем текущем положении. Демон <b>{html_escape(dname)}</b> стал держателем вашего \"основного актива\".</i>"
+            f"<i>К письму прилагался отчет о вашем текущем положении. Демон <b>{html_escape(dname)}</b> стал держателем вашего \"основного актива\".</i>\n"
+            "Всё же стоило читать условия страховки и соц.пакета..."
         )
 
     if kind == "demon_pay":
@@ -1715,8 +1804,6 @@ def _mail_letter_text(kind: str, amount_cents: int) -> str:
 
     if kind == "intro":
         body = "Ваш доброжелатель очень рад вашему вниманию и, в качестве поощрения будет раз в день высылать вам подарок."
-    elif kind == "low":
-        body = "Анонимный доброжелатель разочарован вашей отдачей."
     else:
         body = "Анонимный доброжелатель заметил вашу отдачу. Примите в качестве его благодарности скромный подарок."
 
@@ -1768,13 +1855,8 @@ def _mail_daemon():
                     except Exception:
                         pass
                 else:
-                    games = get_games_total(uid)
-                    if games >= 3:
-                        kind = "std"
-                        amt = 40000
-                    else:
-                        kind = "low"
-                        amt = 1000
+                    kind = "std"
+                    amt = 40000
                     cur.execute("UPDATE daily_mail SET next_ts=? WHERE user_id=?", (now + MAIL_PERIOD_SEC, uid))
                     conn.commit()
                     try:
@@ -1782,7 +1864,7 @@ def _mail_daemon():
                     except Exception:
                         pass
         except Exception:
-            pass
+            send_error_report("_mail_daemon")
         time.sleep(30)
 
 def top_value_cents(uid: int) -> int:
@@ -1968,7 +2050,7 @@ def update_demon_streak_after_game(game_id: str):
         else:
             set_demon_streak(uid, 0)
 
-# SHOP: CATALOG + LOGIC
+# SHOP: CATALOG
 SHOP_ITEMS = {
     "magnet": {
         "title": "🧲 Магнит",
@@ -2003,14 +2085,14 @@ SHOP_ITEMS = {
         "price_cents": 1300_00,
         "max_qty": 1,
         "duration_games": 1,
-        "desc": "Защита ваших денежных средств в случае непредвиденных затрат. Полностью сохраняет Ваши финансы от проигрыша. Всё бы ничего, однако материал бумаги подозрительно схож со структурой контракта... Рискуем?",
+        "desc": "Защита Ваших денежных средств в случае непредвиденных затрат. Полностью сохраняет Ваши финансы от проигрыша. Соглашаясь с условиями оформления Вы полностью осознаете все сопутствующие риски. в̶п̶л̶о̶т̶ь̶ д̶о̶ п̶о̶т̶е̶р̶и̶ п̶р̶а̶в̶а̶ н̶а̶ ж̶и̶з̶н̶ь̶. ",
     },
     "paket": {
         "title": "📑 Пакет соц.поддержки",
         "price_cents": 1600_00,
         "max_qty": 1,
         "duration_games": 1,
-        "desc": "Заверено нотариусом! Несколько важных бумаг в одном пакете: страхование капитала, социальный пакет, денежная компенсация! С ним вернется полная стоимость вашего проигрыша! Однако, всё имеет свою цену...",
+        "desc": "Заверено нотариусом! Несколько важных бумаг в одном пакете: страхование капитала, социальный пакет, денежная компенсация! С ним вернется полная стоимость Вашего проигрыша! Соглашаясь с условиями оформления Вы полностью осознаете все сопутствующие риски. в̶п̶л̶о̶т̶ь̶ д̶о̶ п̶о̶т̶е̶р̶и̶ п̶р̶а̶в̶а̶ н̶а̶ ж̶и̶з̶н̶ь̶. ",
     },
         "lucky_chip": {
         "title": "🉐 Удачная фишка",
@@ -2024,14 +2106,14 @@ SHOP_ITEMS = {
         "price_cents": 400_00,
         "max_qty": 4,
         "duration_games": 1,
-        "desc": "Увеличивает шанс Чёрного на 5%",
+        "desc": "Увеличивает шанс Чёрного на 5%. Складывается до 3 стаков (+15%), затем уходит на откат 1 час.",
     },
     "red_chip": {
         "title": "🔴 Красная фишка",
         "price_cents": 400_00,
         "max_qty": 4,
         "duration_games": 1,
-        "desc": "Увеличивает шанс Красного на 5%",
+        "desc": "Увеличивает шанс Красного на 5%. Складывается до 3 стаков (+15%), затем уходит на откат 1 час.",
     },
 }
 
@@ -2045,27 +2127,43 @@ def shop_allowed_items_for_game_type(game_type: str) -> set:
         return {"insurance", "paket"} | set(SHOP_ZERO_ONLY_ITEMS)
     return set(SHOP_ITEMS.keys()) - set(SHOP_ZERO_ONLY_ITEMS)
 
-# SHOP: cooldown for "insurance" + "paket"
-SHOP_PROTECT_COOLDOWN_SEC = 4 * 3600
+# SHOP: cooldown
+SHOP_ITEM_COOLDOWN_SEC = {
+    "insurance": 4 * 3600,
+    "paket": 8 * 3600,
+    "black_chip": 1 * 3600,
+    "red_chip": 1 * 3600,
+}
 
-def shop_get_protect_next_ts(uid: int) -> int:
-    r = db_one("SELECT COALESCE(next_protect_ts,0) FROM shop_cooldowns WHERE user_id=?", (int(uid),))
-    if not r:
-        db_exec("INSERT OR IGNORE INTO shop_cooldowns (user_id, next_protect_ts) VALUES (?,0)", (int(uid),), commit=True)
-        return 0
+SHOP_STACKABLE_ZERO_ITEMS = {"black_chip", "red_chip"}
+SHOP_STACK_MAX = 3
+
+def shop_get_item_next_ts(uid: int, key: str) -> int:
+    r = db_one(
+        "SELECT COALESCE(next_ts,0) FROM shop_item_cooldowns WHERE user_id=? AND item_key=?",
+        (int(uid), str(key))
+    )
     return int((r[0] if r else 0) or 0)
 
-def shop_set_protect_next_ts(uid: int, next_ts: int) -> None:
+def shop_set_item_next_ts(uid: int, key: str, next_ts: int) -> None:
     db_exec(
-        "INSERT INTO shop_cooldowns (user_id, next_protect_ts) VALUES (?,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET next_protect_ts=excluded.next_protect_ts",
-        (int(uid), int(next_ts)),
+        "INSERT INTO shop_item_cooldowns (user_id, item_key, next_ts) VALUES (?,?,?) "
+        "ON CONFLICT(user_id,item_key) DO UPDATE SET next_ts=excluded.next_ts",
+        (int(uid), str(key), int(next_ts)),
         commit=True
     )
 
-def shop_protect_cooldown_left(uid: int) -> int:
-    left = shop_get_protect_next_ts(uid) - now_ts()
+def shop_item_cooldown_left(uid: int, key: str) -> int:
+    left = shop_get_item_next_ts(uid, key) - now_ts()
     return max(0, int(left))
+
+def shop_item_cooldown_text(uid: int, key: str) -> str:
+    left = shop_item_cooldown_left(uid, key)
+    if left <= 0:
+        return ""
+    nxt = shop_get_item_next_ts(uid, key)
+    nxt_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(nxt)))
+    return f"Следующая активация через <b>{_format_duration(left)}</b> (<b>{nxt_txt}</b>)"
 
 # SHOP: dynamic pricing (balance-based)
 SHOP_PRICE_STEP_CENTS = 5000_00  # each full $ on balance increases price
@@ -2424,12 +2522,11 @@ def shop_activate(uid: int, key: str) -> tuple[bool, str]:
     if key == "paket" and is_slave(uid):
         return False, "Этот товар недоступен для рабов."
 
-    if key in ("insurance", "paket"):
-        left = shop_protect_cooldown_left(uid)
-        if left > 0:
-            nxt = shop_get_protect_next_ts(uid)
-            nxt_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(nxt)))
-            return False, f"Следующая активация доступна {nxt_txt} (через {_format_duration(left)})."
+    left = shop_item_cooldown_left(uid, key)
+    if left > 0:
+        nxt = shop_get_item_next_ts(uid, key)
+        nxt_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(nxt)))
+        return False, f"Следующая активация через <b>{_format_duration(left)}</b> (<b>{nxt_txt}</b>)."
 
     item = SHOP_ITEMS[key]
     have = shop_get_qty(uid, key)
@@ -2437,14 +2534,39 @@ def shop_activate(uid: int, key: str) -> tuple[bool, str]:
         return False, "У тебя нет этого предмета."
 
     active = shop_get_active(uid)
-    if key in active and active[key] > 0:
+    active_now = int(active.get(key, 0) or 0)
+
+    # Красная/чёрная фишки: стакаются до 3 раз
+    if key in SHOP_STACKABLE_ZERO_ITEMS:
+        if active_now >= SHOP_STACK_MAX:
+            cd = int(SHOP_ITEM_COOLDOWN_SEC.get(key, 0) or 0)
+            if cd > 0 and shop_item_cooldown_left(uid, key) <= 0:
+                shop_set_item_next_ts(uid, key, now_ts() + cd)
+            return False, "Достигнут максимальный стак этого эффекта."
+
+        new_stack = active_now + 1
+        shop_set_qty(uid, key, have - 1)
+        shop_set_active(uid, key, new_stack)
+
+        if new_stack >= SHOP_STACK_MAX:
+            cd = int(SHOP_ITEM_COOLDOWN_SEC.get(key, 0) or 0)
+            if cd > 0:
+                shop_set_item_next_ts(uid, key, now_ts() + cd)
+
+        return True, f"Активировано. Текущий стак: {new_stack}/{SHOP_STACK_MAX}."
+
+    # Обычные предметы
+    if key in active and active_now > 0:
         return False, "Этот эффект уже активен."
 
     shop_set_qty(uid, key, have - 1)
     shop_set_active(uid, key, int(item["duration_games"]))
 
+    # Индивидуальный откат для предметов с кулдауном
     if key in ("insurance", "paket"):
-        shop_set_protect_next_ts(uid, now_ts() + SHOP_PROTECT_COOLDOWN_SEC)
+        cd = int(SHOP_ITEM_COOLDOWN_SEC.get(key, 0) or 0)
+        if cd > 0:
+            shop_set_item_next_ts(uid, key, now_ts() + cd)
 
     return True, f"Активировано на {item['duration_games']} игр."
 
@@ -2496,6 +2618,12 @@ def shop_tick_after_game(uid: int, game_id: str):
         if k in ("insurance", "paket"):
             if not shop_is_used(uid, game_id, k):
                 continue
+            shop_set_active(uid, k, int(rem) - 1)
+            continue
+
+        if k in SHOP_STACKABLE_ZERO_ITEMS:
+            shop_set_active(uid, k, 0)
+            continue
 
         shop_set_active(uid, k, int(rem) - 1)
 
@@ -2513,8 +2641,10 @@ def shop_menu_text(uid: int) -> str:
     act_lines = []
     for k, rem in active.items():
         title = SHOP_ITEMS.get(k, {}).get("title", k)
-        act_lines.append(f"• {html_escape(title)} - осталось <b>{rem}</b> игр")
-
+        if k in SHOP_STACKABLE_ZERO_ITEMS:
+            act_lines.append(f"• {html_escape(title)} - стак <b>{rem}</b>/<b>{SHOP_STACK_MAX}</b>")
+        else:
+            act_lines.append(f"• {html_escape(title)} - осталось <b>{rem}</b> игр")
     act_block = "\n".join(act_lines) if act_lines else "Нет"
 
     return (
@@ -2552,12 +2682,9 @@ def shop_item_text(uid: int, key: str) -> str:
     markup_line = (f"Надбавка к цене: <b>+{price_steps * SHOP_PRICE_STEP_ADD_PCT}%</b>\n" if price_steps > 0 else "")
 
     cooldown_line = ""
-    if key in ("insurance", "paket"):
-        left = shop_protect_cooldown_left(uid)
-        if left > 0:
-            nxt = shop_get_protect_next_ts(uid)
-            nxt_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(nxt)))
-            cooldown_line = f"Следующая активация: <b>{nxt_txt}</b> (через {_format_duration(left)})\n"
+    cd_txt = shop_item_cooldown_text(uid, key)
+    if cd_txt:
+        cooldown_line = cd_txt + "\n"
 
     warn = ""
     if key == "paket" and is_slave(uid):
@@ -2571,7 +2698,7 @@ def shop_item_text(uid: int, key: str) -> str:
         f"{markup_line}"
         f"Количество: <b>{have}</b> из <b>{item['max_qty']}</b>\n"
         f"{cooldown_line}"
-        f"Активен: <b>{rem}</b> игр"
+        f"{f'Активный стак: <b>{rem}</b> из <b>{SHOP_STACK_MAX}</b>' if key in SHOP_STACKABLE_ZERO_ITEMS else f'Активен: <b>{rem}</b> игр'}"
     )
 
 def shop_item_kb(uid: int, key: str) -> InlineKeyboardMarkup:
@@ -2586,7 +2713,7 @@ def shop_item_kb(uid: int, key: str) -> InlineKeyboardMarkup:
     can_activate = (shop_get_qty(uid, key) > 0) and (shop_get_active(uid).get(key, 0) <= 0)
 
     if can_activate and key in ("insurance", "paket"):
-        if shop_protect_cooldown_left(uid) > 0:
+        if shop_item_cooldown_left(uid) > 0:
             can_activate = False
 
     if can_activate:
@@ -3529,7 +3656,7 @@ def on_credit(call: CallbackQuery):
         kb.add(InlineKeyboardButton("Отказаться", callback_data=cb_pack(f"credit:cancel:{sum_cents}", uid)))
 
         text = (
-            "<i><u>Кредитная организация НПАО \"Greed\"</u></i>\n"
+            "<i><u>Кредитная организация НПАО \"G®️eed\"</u></i>\n"
             "Номер 7660006213 ОГРН 132066630021\n"
             "Предоставление частных кредитных услуг на комфортные сроки под приятные процентные ставки.\n"
             f"Желаемая сумма: <b>{cents_to_money_str(sum_cents)}</b>$\n\n"
@@ -3645,7 +3772,7 @@ def on_credit(call: CallbackQuery):
             return
 
         text = (
-            "<i><u>Кредитная организация НПАО \"Greed\"</u></i>\n"
+            "<i><u>Кредитная организация НПАО \"G®️eed\"</u></i>\n"
             "Номер 7660006213 ОГРН 132066630021\n"
             "Предоставление частных кредитных услуг на комфортные сроки под приятные процентные ставки.\n"
             f"Желаемая сумма: <b>{cents_to_money_str(sum_cents)}</b>$\n\n"
@@ -4075,7 +4202,7 @@ def on_inline(q: InlineQuery):
             text = (
                 f"Имя: <b>{html_escape(u[2])}</b>" + (f" (@{html_escape(u[1])})" if u[1] else "") +
                 f"\n\nРаботает по вакансии <b>{html_escape(job_title)}</b>\n"
-                f"Вернётся через: <b>{_format_duration(left)}</b>"
+                f"Вернётся через <b>{_format_duration(left)}</b>"
             )
             results.append(inline_article(
                 "Работа",
@@ -4212,7 +4339,7 @@ def on_inline(q: InlineQuery):
                 ok, msg = credit_amount_ok(uid, sum_cents)
                 if not ok:
                     text = (
-                        "<i><u>Кредитная организация НПАО \"Greed\"</u></i>\n"
+                        "<i><u>Кредитная организация НПАО \"G®️eed\"</u></i>\n"
                         "Номер 7660006213 ОГРН 132066630021\n"
                         "Предоставление частных кредитных услуг на комфортные сроки под приятные процентные ставки.\n"
                         f"Запрошено: <b>{cents_to_money_str(sum_cents)}</b>$\n\n"
@@ -4221,7 +4348,7 @@ def on_inline(q: InlineQuery):
                     kb = InlineKeyboardMarkup()
                 else:
                     text = (
-                        "<i><u>Кредитная организация НПАО \"Greed\"</u></i>\n"
+                        "<i><u>Кредитная организация НПАО \"G®️eed\"</u></i>\n"
                         "Номер 7660006213 ОГРН 132066630021\n"
                         "Предоставление частных кредитных услуг на комфортные сроки под приятные процентные ставки.\n"
                         f"Желаемая сумма: <b>{cents_to_money_str(sum_cents)}</b>$\n\n"
@@ -4552,6 +4679,66 @@ def on_main_callbacks(call: CallbackQuery):
         return
 
     # PROFILE
+
+    if kind == "profile" and parts[1] == "openview":
+        try:
+            target_id = int(parts[2])
+        except Exception:
+            bot.answer_callback_query(call.id, "Ошибка.", show_alert=True)
+            return
+
+        if is_banned(target_id):
+            edit_inline_or_message(call, "У пользователя нет больше профиля.", reply_markup=None, parse_mode="HTML")
+            bot.answer_callback_query(call.id)
+            return
+
+        text = build_profile_summary_text(target_id)
+        if not text:
+            edit_inline_or_message(call, "У пользователя нет профиля.", reply_markup=None, parse_mode="HTML")
+            bot.answer_callback_query(call.id)
+            return
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton(
+            "Статистика по играм",
+            callback_data=cb_pack(f"profile:gamesview:{target_id}", clicker)
+        ))
+
+        edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+
+    if kind == "profile" and parts[1] == "gamesview":
+        try:
+            target_id = int(parts[2])
+        except Exception:
+            bot.answer_callback_query(call.id, "Ошибка.", show_alert=True)
+            return
+
+        st = get_game_stats(target_id)
+        games_total, wins, losses, max_win, max_lose = st
+        pct_w = (wins / games_total * 100.0) if games_total > 0 else 0.0
+        pct_l = (losses / games_total * 100.0) if games_total > 0 else 0.0
+
+        text = (
+            f"Общее число игр: <b>{games_total}</b>\n"
+            f"Часто играет: <i>{html_escape(get_favorite_game_title(target_id))}</i>\n"
+            f"Победы: <b>{wins}</b> /<b>{pct_w:.1f}%</b>\n"
+            f"Поражения: <b>{losses}</b> /<b>{pct_l:.1f}%</b>\n"
+            f"Максимальная выигранная сумма: <b>{cents_to_money_str(max_win)}</b>$\n"
+            f"Максимальная проигранная сумма: <b>{cents_to_money_str(max_lose)}</b>$"
+        )
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton(
+            "Назад к профилю",
+            callback_data=cb_pack(f"profile:openview:{target_id}", clicker)
+        ))
+
+        edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+
     if kind == "profile" and parts[1] == "open":
         u = get_user(clicker)
         if not u or not u[2]:
@@ -4575,19 +4762,7 @@ def on_main_callbacks(call: CallbackQuery):
             f"Место в топе: <b>{place}</b>"
         )
 
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("Статистика по играм", callback_data=cb_pack("profile:games", clicker)))
-        if clicker == OWNER_ID:
-            kb.add(InlineKeyboardButton("Команды", callback_data=cb_pack("profile:commands", clicker)))
-        if credit_has_active(clicker):
-            kb.add(InlineKeyboardButton("Договор по кредиту", callback_data=cb_pack("profile:credit", clicker)))
-        if has_work_history(clicker):
-            kb.add(InlineKeyboardButton("Трудовая книга", callback_data=cb_pack("profile:workbook", clicker)))
-        if owns_slaves(clicker):
-            kb.add(InlineKeyboardButton("Список рабов", callback_data=cb_pack("profile:slaves", clicker)))
-        if is_slave(clicker):
-            kb.add(InlineKeyboardButton("Статус раба", callback_data=cb_pack("profile:slave_status", clicker)))
-
+        kb = build_profile_open_kb(clicker)
         edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
         bot.answer_callback_query(call.id)
         return
@@ -4856,11 +5031,175 @@ def on_main_callbacks(call: CallbackQuery):
                 text += "Для полноправного владения рабом, выкупите его командой /rebuy"
     
             kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("Освободить раба", callback_data=cb_pack(f"profile:slavefreeask:{slave_id}", clicker)))
             kb.add(InlineKeyboardButton("Назад к списку рабов", callback_data=cb_pack("profile:slaves", clicker)))
             kb.add(InlineKeyboardButton("Назад в профиль", callback_data=cb_pack("profile:open", clicker)))
             edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
             bot.answer_callback_query(call.id)
             return
+
+    if kind == "profile" and parts[1] == "slavefreeask":
+        try:
+            slave_id = int(parts[2])
+        except Exception:
+            bot.answer_callback_query(call.id, "Ошибка.", show_alert=True)
+            return
+
+        row = db_one(
+            "SELECT 1 FROM slavery WHERE slave_id=? AND owner_id=? LIMIT 1",
+            (slave_id, clicker)
+        )
+        if not row:
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("Назад к списку рабов", callback_data=cb_pack("profile:slaves", clicker)))
+            edit_inline_or_message(call, "Вы больше не владеете этим рабом.", reply_markup=kb, parse_mode="HTML")
+            bot.answer_callback_query(call.id)
+            return
+
+        _ensure_slave_meta_row(slave_id)
+        meta = db_one(
+            "SELECT COALESCE(buyout_cents,0) FROM slave_meta WHERE slave_id=?",
+            (slave_id,)
+        )
+        buyout_cents = int((meta[0] if meta else 0) or 0)
+        reward_cents = max(0, buyout_cents // 10)
+
+        text = (
+            "Вы точно уверены, что хотите отпустить раба?\n"
+            "Вы потеряете довольно солидную часть дохода, если решитесь его освободить.\n\n"
+            f"Компенсация за освобождение: <b>{cents_to_money_str(reward_cents)}</b>$"
+        )
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("Да, я уверен", callback_data=cb_pack(f"profile:slavefreeyes:{slave_id}", clicker)))
+        kb.add(InlineKeyboardButton("Я ещё подумаю...", callback_data=cb_pack(f"profile:slavecard:{slave_id}", clicker)))
+
+        edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+
+    if kind == "profile" and parts[1] == "slavefreeyes":
+        try:
+            slave_id = int(parts[2])
+        except Exception:
+            bot.answer_callback_query(call.id, "Ошибка.", show_alert=True)
+            return
+
+        ok, reward_cents = owner_free_slave_with_reward(clicker, slave_id)
+        if not ok:
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("Назад к списку рабов", callback_data=cb_pack("profile:slaves", clicker)))
+            edit_inline_or_message(call, "Освобождение не выполнено: вы больше не владеете этим рабом.", reply_markup=kb, parse_mode="HTML")
+            bot.answer_callback_query(call.id)
+            return
+
+        text = (
+            "Раб освобождён.\n"
+            f"Вам начислено: <b>{cents_to_money_str(reward_cents)}</b>$"
+        )
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("Вернуться к списку рабов", callback_data=cb_pack("profile:slaves", clicker)))
+        kb.add(InlineKeyboardButton("Назад в профиль", callback_data=cb_pack("profile:open", clicker)))
+
+        edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+
+    if kind == "profile" and parts[1] == "rabslist":
+        try:
+            owner_id = int(parts[2])
+        except Exception:
+            bot.answer_callback_query(call.id, "Ошибка.", show_alert=True)
+            return
+
+        text, kb = build_rabs_list_text_kb(owner_id, clicker)
+        edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+
+    if kind == "profile" and parts[1] == "rabsview":
+        try:
+            owner_id = int(parts[2])
+            slave_id = int(parts[3])
+        except Exception:
+            bot.answer_callback_query(call.id, "Ошибка.", show_alert=True)
+            return
+
+        cur.execute("""
+            SELECT COALESCE(earned_cents,0), COALESCE(share_bp,0), COALESCE(acquired_ts,0)
+            FROM slavery
+            WHERE slave_id=? AND owner_id=?
+        """, (slave_id, owner_id))
+        row = cur.fetchone()
+        if not row:
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("Назад к списку рабов", callback_data=cb_pack(f"profile:rabslist:{owner_id}", clicker)))
+            edit_inline_or_message(call, "Этот раб больше не принадлежит выбранному владельцу.", reply_markup=kb, parse_mode="HTML")
+            bot.answer_callback_query(call.id)
+            return
+
+        earned_cents, share_bp, acquired_ts = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+        lasth = int(slave_profit_lasth(slave_id, owner_id) or 0)
+        lastp = int(slave_last_credit(slave_id, owner_id) or 0)
+
+        cur.execute("SELECT short_name, username FROM users WHERE user_id=?", (slave_id,))
+        r = cur.fetchone() or ("Без имени", "")
+        sname = r[0] or "Без имени"
+        sun = r[1] or ""
+        uname_part = f" (@{html_escape(sun)})" if sun else ""
+
+        _ensure_slave_meta_row(slave_id)
+        cur.execute("SELECT COALESCE(buyout_cents,0) FROM slave_meta WHERE slave_id=?", (slave_id,))
+        buyout_cents = int((cur.fetchone() or (0,))[0] or 0)
+
+        ts_txt = "-"
+        if acquired_ts and int(acquired_ts) > 0:
+            ts_txt = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(acquired_ts)))
+
+        text = (
+            f"<b>{html_escape(sname)}</b>{uname_part} <i>{html_escape(ts_txt)}</i>\n"
+            f"Цена раба: <b>{cents_to_money_str(buyout_cents)}</b>$\n"
+            "Общий доход|За последнее время|Последнее начисление\n"
+            f"<u><b>{cents_to_money_str(earned_cents)}</b>$</u>"
+            f"(<b>{cents_to_money_str(lasth)}</b>$) "
+            f"+ <b>{cents_to_money_str(lastp)}</b>$"
+        )
+
+        owners_all = get_slave_owners(slave_id)
+        other = [(oid, bp) for (oid, bp) in owners_all if int(oid) != int(owner_id)]
+
+        if other:
+            total_bp = sum(int(bp or 0) for (_oid, bp) in owners_all) or 0
+            pay_map = {}
+            if buyout_cents > 0 and total_bp > 0 and owners_all:
+                allocated = 0
+                for i, (oid, bp) in enumerate(owners_all):
+                    part = (buyout_cents * int(bp or 0)) // total_bp
+                    pay_map[int(oid)] = int(part)
+                    allocated += int(part)
+                pay_map[int(owners_all[0][0])] = pay_map.get(int(owners_all[0][0]), 0) + (buyout_cents - allocated)
+
+            text += "\n\nВладельцы:\n"
+            for oid, _bp in other:
+                cur.execute("SELECT short_name, username FROM users WHERE user_id=?", (int(oid),))
+                rr = cur.fetchone() or ("Без имени", "")
+                oname = rr[0] or "Без имени"
+                oun = rr[1] or ""
+                ou_part = f" (@{html_escape(oun)})" if oun else ""
+                price = int(pay_map.get(int(oid), 0) or 0)
+                text += (
+                    f"{html_escape(oname)}{ou_part} | Сумма выкупа его доли: "
+                    f"<b>{cents_to_money_str(price)}</b>$\n"
+                )
+            text += "Для полноправного владения рабом, выкупите его командой /rebuy"
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("Назад к списку рабов", callback_data=cb_pack(f"profile:rabslist:{owner_id}", clicker)))
+
+        edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
 
     if kind == "profile" and parts[1] == "slave_status":
         uid = clicker
@@ -4936,7 +5275,7 @@ def on_main_callbacks(call: CallbackQuery):
             text = (
                 f"Имя: <b>{html_escape(u[2])}</b>" + (f" (@{html_escape(u[1])})" if u[1] else "") +
                 f"\n\nРаботает по вакансии <b>{html_escape(job_title)}</b>\n"
-                f"Вернётся через: <b>{_format_duration(left)}</b>"
+                f"Вернётся через <b>{_format_duration(left)}</b>"
                 )
             edit_inline_or_message(call, text, reply_markup=None, parse_mode="HTML")
             bot.answer_callback_query(call.id)
@@ -5040,7 +5379,7 @@ def on_main_callbacks(call: CallbackQuery):
         ends_ts, salary_full = start_shift(clicker, jk)
         text = (
             f"Ты вышел в смену по вакансии <b>{html_escape(job.title)}</b>\n"
-            f"Вернёшься через: <b>{_format_duration(ends_ts - now_ts())}</b>\n\n"
+            f"Вернёшься через <b>{_format_duration(ends_ts - now_ts())}</b>\n\n"
             "Мы уведомим вас, когда смена закончится."
             )
         edit_inline_or_message(call, text, reply_markup=None, parse_mode="HTML")
@@ -5900,8 +6239,10 @@ def end_lobby_if_needed(game_id: str):
         )
         shop_bind_players_for_game(game_id)
 
+        order = turn_order_get(game_id)
+        first_uid = int(order[0]) if order else int(creator_id)
 
-        u = get_user(int(creator_id))
+        u = get_user(first_uid)
         cname = u[2] if u and u[2] else "Игрок"
         stake_now, add = cross_stake_for_round(int(stake_cents or 0), r)
         title = "1×3" if rfmt == "1x3" else ("3×3" if rfmt == "3x3" else "3×5")
@@ -5913,7 +6254,7 @@ def end_lobby_if_needed(game_id: str):
             "Приятной игры."
         )
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton(f"Ход {cname}", callback_data=cb_pack(f"turn:begin:{game_id}", int(creator_id))))
+        kb.add(InlineKeyboardButton(f"Ход {cname}", callback_data=cb_pack(f"turn:begin:{game_id}", first_uid)))
         edit_game_message(game_id, text, reply_markup=kb, parse_mode="HTML")
         return
     
@@ -6500,10 +6841,8 @@ def zero_generate_numbers(game_id: str) -> list:
     lucky_users = []
     for uid in order:
         a = shop_get_active_for_game(int(uid), str(game_id))
-        if a.get("red_chip", 0) > 0:
-            red_cnt += 1
-        if a.get("black_chip", 0) > 0:
-            black_cnt += 1
+        red_cnt += max(0, int(a.get("red_chip", 0) or 0))
+        black_cnt += max(0, int(a.get("black_chip", 0) or 0))
         if a.get("lucky_chip", 0) > 0:
             lucky_users.append(int(uid))
 
@@ -6882,6 +7221,14 @@ def render_game_totals(game_id: str, creator_id: int) -> Tuple[str, InlineKeyboa
     return text, kb
 
 def start_rematch_from_votes(call: CallbackQuery, old_game_id: str, yes_set: set):
+    desired_round = 1 if str(game_type) == "cross" else 0
+    db_exec(
+        "INSERT INTO turn_orders (game_id, order_csv, round, updated_ts) VALUES (?,?,?,?) "
+        "ON CONFLICT(game_id) DO UPDATE SET order_csv=excluded.order_csv, round=excluded.round, updated_ts=excluded.updated_ts",
+        (str(new_game_id), ",".join(str(x) for x in new_order), int(desired_round), int(now_ts())),
+        commit=True
+    )
+    shop_bind_players_for_game(new_game_id)    
     cur.execute("SELECT group_key, creator_id, stake_cents, roulette_format, COALESCE(game_type,'roulette') FROM games WHERE game_id=?", (old_game_id,))
     old = cur.fetchone()
     if not old:
@@ -6999,7 +7346,8 @@ def start_rematch_from_votes(call: CallbackQuery, old_game_id: str, yes_set: set
         edit_inline_or_message(call, wait_text, reply_markup=None, parse_mode="HTML")
         return
 
-    first_uid = new_order[0]
+    order = turn_order_get(new_game_id)
+    first_uid = int(order[0]) if order else int(new_order[0])    
     first_u = get_user(first_uid)
     first_name = first_u[2] if first_u and first_u[2] else "Игрок"
 
@@ -7241,9 +7589,13 @@ def handle_continue(call: CallbackQuery, game_id: str):
                     (rfmt, r, game_id))
         conn.commit()
 
-        u = get_user(int(creator_id))
+
+        order = turn_order_get(game_id)
+        first_uid = int(order[0]) if order else int(creator_id)
+
+        u = get_user(first_uid)
         cname = u[2] if u and u[2] else "Игрок"
-        stake_now, add = cross_stake_for_round(stake_cents, r)
+        stake_now, add = cross_stake_for_round(int(stake_cents or 0), r)
         title = "1×3" if rfmt == "1x3" else ("3×3" if rfmt == "3x3" else "3×5")
         text = (
             "Выбор сохранён.\n"
@@ -7253,7 +7605,7 @@ def handle_continue(call: CallbackQuery, game_id: str):
             "Приятной игры."
         )
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton(f"Ход {cname}", callback_data=cb_pack(f"turn:begin:{game_id}", int(creator_id))))
+        kb.add(InlineKeyboardButton(f"Ход {cname}", callback_data=cb_pack(f"turn:begin:{game_id}", first_uid)))
         edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
         bot.answer_callback_query(call.id)
         return
@@ -7806,6 +8158,7 @@ def on_spin_pull(call: CallbackQuery):
                 print("run_spin crashed:", repr(e))
             except Exception:
                 pass
+            send_error_report(f"run_spin game_id={game_id} uid={uid}", e)
         finally:
             db_exec("UPDATE spins SET stage='done' WHERE game_id=? AND user_id=?", (game_id, uid), commit=True)
     
@@ -7912,6 +8265,45 @@ def get_game_stats(uid: int) -> Tuple[int,int,int,int,int]:
     cur.execute("SELECT games_total, wins, losses, max_win_cents, max_lose_cents FROM game_stats WHERE user_id=?", (uid,))
     row = cur.fetchone()
     return tuple(int(x or 0) for x in row)
+
+def build_profile_summary_text(view_uid: int) -> Optional[str]:
+    u = get_user(int(view_uid))
+    if not u or not u[2]:
+        return None
+
+    cur.execute("SELECT user_id FROM users WHERE demon=0")
+    uids = [int(r[0]) for r in cur.fetchall()]
+    uids.sort(key=lambda x: top_value_cents(x), reverse=True)
+
+    place = (uids.index(int(view_uid)) + 1) if (int(u[7] or 0) == 0 and int(view_uid) in uids) else "-"
+    status = compute_status(int(view_uid))
+
+    return (
+        f"Имя пользователя: <i>{html_escape(u[2])}</i>\n"
+        f"Дата подписания контракта: <b>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(u[4] or u[3] or now_ts()))}</b>\n"
+        f"Статус: <b>{html_escape(status)}</b>\n"
+        f"Капитал: <b>{cents_to_money_str(int(u[5] or 0))}</b>$\n"
+        f"Место в топе: <b>{place}</b>"
+    )
+
+def build_profile_open_kb(uid: int) -> InlineKeyboardMarkup:
+    uid = int(uid)
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Статистика по играм", callback_data=cb_pack("profile:games", uid)))
+
+    if uid == OWNER_ID:
+        kb.add(InlineKeyboardButton("Команды", callback_data=cb_pack("profile:commands", uid)))
+    if credit_has_active(uid):
+        kb.add(InlineKeyboardButton("Договор по кредиту", callback_data=cb_pack("profile:credit", uid)))
+    if has_work_history(uid):
+        kb.add(InlineKeyboardButton("Трудовая книга", callback_data=cb_pack("profile:workbook", uid)))
+    if owns_slaves(uid):
+        kb.add(InlineKeyboardButton("Список рабов", callback_data=cb_pack("profile:slaves", uid)))
+    if is_slave(uid):
+        kb.add(InlineKeyboardButton("Статус раба", callback_data=cb_pack("profile:slave_status", uid)))
+
+    return kb
 
 def slavery_add_owner(slave_id: int, owner_id: int, share_bp: int = 6000) -> bool:
     """
@@ -8105,6 +8497,103 @@ def free_slave_fully(slave_id: int, reason: str):
     except Exception:
         pass
 
+def owner_free_slave_with_reward(owner_id: int, slave_id: int) -> Tuple[bool, int]:
+    """
+    Добровольное освобождение раба владельцем:
+    - полностью снимает с пользователя статус раба
+    - начисляет инициатору 10% от текущей суммы выкупа
+    Возвращает (ok, reward_cents)
+    """
+    owner_id = int(owner_id)
+    slave_id = int(slave_id)
+
+    row = db_one(
+        "SELECT 1 FROM slavery WHERE slave_id=? AND owner_id=? LIMIT 1",
+        (slave_id, owner_id)
+    )
+    if not row:
+        return False, 0
+
+    _ensure_slave_meta_row(slave_id)
+    meta = db_one(
+        "SELECT COALESCE(buyout_cents,0) FROM slave_meta WHERE slave_id=?",
+        (slave_id,)
+    )
+    buyout_cents = int((meta[0] if meta else 0) or 0)
+    reward_cents = max(0, buyout_cents // 10)
+
+    if reward_cents > 0:
+        add_balance(owner_id, reward_cents)
+
+    free_slave_fully(slave_id, "Владелец добровольно освободил раба.")
+    return True, reward_cents
+
+
+def build_rabs_list_text_kb(owner_id: int, viewer_id: int) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    owner_id = int(owner_id)
+    viewer_id = int(viewer_id)
+
+    rr = db_one(
+        "SELECT short_name, username FROM users WHERE user_id=?",
+        (owner_id,)
+    )
+    owner_name = (rr[0] if rr else None) or "Без имени"
+    owner_username = (rr[1] if rr else "") or ""
+
+    rows = db_all("""
+        SELECT slave_id, COALESCE(earned_cents,0), COALESCE(share_bp,0), COALESCE(acquired_ts,0)
+        FROM slavery
+        WHERE owner_id=?
+        ORDER BY COALESCE(earned_cents,0) DESC
+    """, (owner_id,)) or []
+
+    head_owner_un = f" (@{html_escape(owner_username)})" if owner_username else ""
+    intro = f"Список рабов пользователя <b>{html_escape(owner_name)}</b>{head_owner_un}"
+    intro2 = "\n\nЧтобы приобрести раба, используйте /buyrab"
+
+    if not rows:
+        return intro + "\nПусто", None
+
+    lines = [intro, "", "Имя|Общий доход|За последнее время|Последнее зачисление"]
+    top = rows[:20]
+
+    kb = InlineKeyboardMarkup()
+    slave_buttons = []
+
+    for i, (slave_id, earned_cents, _share_bp, _acquired_ts) in enumerate(top, 1):
+        slave_id = int(slave_id)
+        earned_cents = int(earned_cents or 0)
+        lasth = int(slave_profit_lasth(slave_id, owner_id) or 0)
+        lastp = int(slave_last_credit(slave_id, owner_id) or 0)
+
+        sr = db_one("SELECT short_name, username FROM users WHERE user_id=?", (slave_id,))
+        sname = (sr[0] if sr else None) or "Без имени"
+        sun = (sr[1] if sr else "") or ""
+
+        uname_part = f" (@{html_escape(sun)})" if sun else ""
+        lines.append(
+            f"{i}|<b>{html_escape(sname)}</b>{uname_part} "
+            f"<u><b>{cents_to_money_str(earned_cents)}</b>$</u>"
+            f"(<b>{cents_to_money_str(lasth)}</b>$) "
+            f"+ <b>{cents_to_money_str(lastp)}</b>$"
+        )
+
+        btn_text = sname
+        if len(btn_text) > 18:
+            btn_text = btn_text[:18] + "…"
+
+        slave_buttons.append(
+            InlineKeyboardButton(
+                btn_text,
+                callback_data=cb_pack(f"profile:rabsview:{owner_id}:{slave_id}", viewer_id)
+            )
+        )
+
+    for i in range(0, len(slave_buttons), 3):
+        kb.row(*slave_buttons[i:i + 3])
+
+    return "\n".join(lines) + intro2, kb
+
 def emancipate_slaves_after_game(game_id: str):
     """
     Освобождение после игры:
@@ -8219,7 +8708,7 @@ def apply_demon_life_settlement(game_id: str):
                 uname = f" (@{un})" if un else ""
                 bot.send_message(
                     loser_id,
-                    f"Ты проиграл свою свободу. С этого момента ты личная собственность: <b>{html_escape(w[2] or 'Демон')}</b>{uname}",
+                    f"Ты проиграл свою свободу. С этого момента ты личная собственность <b>{html_escape(w[2] or 'Демон')}</b>{uname}",
                     parse_mode="HTML"
                 )
             except Exception:
@@ -8281,7 +8770,7 @@ def _work_daemon():
             for uid in uids:
                 finish_shift(uid)
         except Exception:
-            pass
+            send_error_report("_work_daemon")
         time.sleep(2)
 
 threading.Thread(target=_work_daemon, daemon=True).start()
@@ -8317,33 +8806,87 @@ def cmd_finance(message):
     lines = raw.split("\n")
     head = (lines[0] or "").strip()
     comment = "\n".join(lines[1:]).strip()
-
     parts = head.split()
-    if len(parts) < 3 or not parts[1].startswith("@"):
-        bot.reply_to(message, "Использование: /finance @username сумма\n<комментарий (необязательно)>")
+
+    mode = None
+    uname = ""
+    amt_token = ""
+
+    if len(parts) >= 3 and parts[1].startswith("@"):
+        mode = "single"
+        uname = parts[1][1:]
+        amt_token = parts[2]
+
+    elif len(parts) >= 2:
+        mode = "all"
+        amt_token = parts[1]
+
+    else:
+        bot.reply_to(
+            message,
+            "Использование:\n"
+            "/finance @username сумма\n"
+            "или\n"
+            "/finance сумма\n"
+            "<комментарий (необязательно)>"
+        )
         return
 
-    uname = parts[1][1:]
-    amt = money_to_cents(parts[2])
+    amt = money_to_cents(amt_token)
     if amt is None:
         bot.reply_to(message, "Неверная сумма.")
         return
 
-    r = db_one("SELECT user_id FROM users WHERE username=?", (uname,))
-    if not r:
-        bot.reply_to(message, "Пользователь не найден в базе.")
+    payload = base64.urlsafe_b64encode((comment or "").encode("utf-8")).decode("ascii")
+
+    if mode == "single":
+        r = db_one("SELECT user_id FROM users WHERE username=?", (uname,))
+        if not r:
+            bot.reply_to(message, "Пользователь не найден в базе.")
+            return
+
+        uid = int(r[0])
+
+        try:
+            ensure_daily_mail_row(uid)
+            _send_mail_prompt(uid, f"owner_finance|{payload}", int(amt))
+        except Exception:
+            bot.reply_to(message, "Не удалось отправить письмо пользователю.")
+            return
+
+        bot.reply_to(
+            message,
+            f"Письмо отправлено пользователю @{uname} с суммой в размере {cents_to_money_str(amt)}$"
+        )
         return
 
-    uid = int(r[0])
+    # Массовая рассылка
+    rows = db_all(
+        "SELECT user_id FROM users WHERE COALESCE(contract_ts,0) > 0 ORDER BY user_id"
+    )
+    if not rows:
+        bot.reply_to(message, "В базе нет зарегистрированных пользователей для рассылки.")
+        return
 
-    try:
-        ensure_daily_mail_row(uid)
-        payload = base64.urlsafe_b64encode((comment or "").encode("utf-8")).decode("ascii")
-        _send_mail_prompt(uid, f"owner_finance|{payload}", int(amt))
-    except Exception:
-        pass
+    sent = 0
+    failed = 0
 
-    bot.reply_to(message, f"Письмо отправлено пользователю @{uname} с суммой в размере {cents_to_money_str(amt)}$")
+    for (uid,) in rows:
+        uid = int(uid)
+        try:
+            ensure_daily_mail_row(uid)
+            _send_mail_prompt(uid, f"owner_finance|{payload}", int(amt))
+            sent += 1
+        except Exception:
+            failed += 1
+
+    bot.reply_to(
+        message,
+        "Массовая рассылка завершена.\n"
+        f"Отправлено: {sent}\n"
+        f"Ошибок: {failed}\n"
+        f"Сумма каждому: {cents_to_money_str(amt)}$"
+    )
 
 @bot.message_handler(commands=["take"])
 def cmd_take(message):
@@ -8463,7 +9006,7 @@ def cmd_reg(message):
     try:
         bot.send_message(
             uid,
-            f"Вы зарегистрированы администратором. Ваше имя: <b>{html_escape(name)}</b>",
+            f"В вашем почтовом ящике лежало письмо контракта с заполненой строкой имени: <b>{html_escape(name)}</b>",
             parse_mode="HTML"
         )
     except Exception:
@@ -8608,7 +9151,7 @@ def cmd_blockcash(message):
         return
 
     
-    sec = min(sec, 30 * 86400)# максимум 30 дней
+    sec = min(sec, 30 * 86400) # максимум 30 дней
 
     ts = now_ts()
     until_ts = ts + int(sec)
@@ -8658,7 +9201,7 @@ def cmd_blockcash(message):
     try:
         bot.send_message(
             int(target_id),
-            f"Ваш счёт принудительно временно недоступен. Блокировка переводов истечёт через <b>{_format_duration(left)}</b> ({until_txt}). Сотрудник  НПАО \"Greed\"",
+            f"Ваш счёт был принудительно заморожен. Блокировка переводов истечёт через <b>{_format_duration(left)}</b> (Дата разблокировки <b>{until_txt}</b>). Сотрудник КО НПАО \"G®️eed\"",
             parse_mode="HTML"
         )
     except Exception:
@@ -8735,9 +9278,42 @@ def cmd_udblockcash(message):
     bot.reply_to(message, f"Готово. Блокировка переводов снята с <b>{html_escape(tname)}</b>{tun_part}.", parse_mode="HTML")
 
     try:
-        bot.send_message(int(target_id), "С вашего счёта снята блокировка переводов средств. Благодарим вас за оидание. Ваш НПАО \"Greed\"", parse_mode="HTML")
+        bot.send_message(int(target_id), "С вашего счёта снята блокировка переводов средств. Благодарим вас за оидание. Ваш НПАО \"G®️eed\"", parse_mode="HTML")
     except Exception:
         pass
+
+def get_known_broadcast_group_ids() -> List[int]:
+    """
+    Берём только те группы, чьи chat_id уже известны боту по базе.
+    Источники:
+    - games.origin_chat_id
+    - transfers.chat_id
+    """
+    out: List[int] = []
+    seen = set()
+
+    queries = [
+        "SELECT DISTINCT COALESCE(origin_chat_id,0) FROM games WHERE COALESCE(origin_chat_id,0) < 0",
+        "SELECT DISTINCT COALESCE(chat_id,0) FROM transfers WHERE COALESCE(chat_id,0) < 0",
+    ]
+
+    for sql in queries:
+        try:
+            rows = db_all(sql, ())
+        except Exception:
+            rows = []
+
+        for r in rows or []:
+            try:
+                chat_id = int((r[0] if r else 0) or 0)
+            except Exception:
+                chat_id = 0
+
+            if chat_id < 0 and chat_id not in seen:
+                seen.add(chat_id)
+                out.append(chat_id)
+
+    return out
 
 @bot.message_handler(commands=["remessage"])
 def cmd_remessage(message):
@@ -8762,11 +9338,12 @@ def cmd_remessage(message):
         bot.reply_to(message, "Текст рассылки пуст.")
         return
 
-    rows = db_all("SELECT user_id FROM users", ())
+    rows = db_all("SELECT user_id FROM users WHERE COALESCE(contract_ts,0) > 0", ())
     uids = [int(r[0]) for r in (rows or []) if r and str(r[0]).isdigit()]
 
-    sent = 0
-    failed = 0
+    if not uids:
+        bot.reply_to(message, "Нет зарегистрированных пользователей для рассылки.")
+        return
 
     def _parse_retry_after(exc: Exception) -> float:
         s = str(exc)
@@ -8778,24 +9355,105 @@ def cmd_remessage(message):
                 return 0.0
         return 0.0
 
-    for uid in uids:
+    def _send_with_retry(chat_id: int, text: str) -> bool:
         try:
-            bot.send_message(uid, body, parse_mode="HTML")
-            sent += 1
+            bot.send_message(int(chat_id), text, parse_mode="HTML")
+            return True
         except Exception as e:
             ra = _parse_retry_after(e)
             if ra and ra > 0:
                 time.sleep(ra + 0.2)
                 try:
-                    bot.send_message(uid, body, parse_mode="HTML")
-                    sent += 1
-                    continue
+                    bot.send_message(int(chat_id), text, parse_mode="HTML")
+                    return True
                 except Exception:
-                    pass
+                    return False
+            return False
+
+    covered_uids = set()
+
+    group_sent = 0
+    group_failed = 0
+    group_checked = 0
+
+    bot_me_id = 0
+    try:
+        if ME:
+            bot_me_id = int(getattr(ME, "id", 0) or 0)
+    except Exception:
+        bot_me_id = 0
+
+    if bot_me_id <= 0:
+        try:
+            me = bot.get_me()
+            bot_me_id = int(getattr(me, "id", 0) or 0)
+        except Exception:
+            bot_me_id = 0
+
+    group_ids = get_known_broadcast_group_ids()
+
+    for chat_id in group_ids:
+        group_checked += 1
+
+        try:
+            if bot_me_id > 0:
+                me_member = bot.get_chat_member(int(chat_id), int(bot_me_id))
+                me_status = str(getattr(me_member, "status", "") or "")
+                if me_status in ("left", "kicked"):
+                    continue
+            else:
+                bot.get_chat(int(chat_id))
+        except Exception:
+            continue
+
+        members_here = []
+
+        for uid in uids:
+            if uid in covered_uids:
+                continue
+            try:
+                mem = bot.get_chat_member(int(chat_id), int(uid))
+                st = str(getattr(mem, "status", "") or "")
+                if st and st not in ("left", "kicked"):
+                    members_here.append(int(uid))
+            except Exception:
+                pass
+            time.sleep(0.02)
+
+        if not members_here:
+            continue
+
+        if _send_with_retry(int(chat_id), body):
+            group_sent += 1
+            covered_uids.update(members_here)
+        else:
+            group_failed += 1
+
+        time.sleep(0.05)
+
+    sent = 0
+    failed = 0
+
+    for uid in uids:
+        if uid in covered_uids:
+            continue
+
+        if _send_with_retry(int(uid), body):
+            sent += 1
+        else:
             failed += 1
+
         time.sleep(0.03)
 
-    bot.reply_to(message, f"Рассылка завершена. Успешно: {sent}, ошибок: {failed}")
+    bot.reply_to(
+        message,
+        "Рассылка завершена.\n"
+        f"Групповых отправок: {group_sent}\n"
+        f"Ошибок по группам: {group_failed}\n"
+        f"Личных отправок: {sent}\n"
+        f"Ошибок в ЛС: {failed}\n"
+        f"Проверено групп: {group_checked}"
+    )
 
 @bot.message_handler(commands=["del"])
 def cmd_del(message):
@@ -9044,35 +9702,92 @@ def cmd_get(message):
 
 @bot.message_handler(commands=["profile"])
 def cmd_profile(message):
-    if message.chat.type != "private":
-        return
     uid = message.from_user.id
     username = getattr(message.from_user, "username", None)
     upsert_user(uid, username)
 
     if is_banned(uid):
-        bot.reply_to(message, "У вас нет больше профиля.")
-        return
-    
-    u = get_user(uid)
-    if not u or not u[2]:
+        if message.chat.type == "private":
+            bot.reply_to(message, "У вас нет больше профиля.")
         return
 
-    cur.execute("SELECT user_id FROM users WHERE demon=0")
-    uids = [r[0] for r in cur.fetchall()]
-    uids.sort(key=lambda x: top_value_cents(x), reverse=True)
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
+        target_id = int(getattr(target_user, "id", 0) or 0)
 
-    place = (uids.index(uid) + 1) if (u[7] == 0 and uid in uids) else "-"
-    status = compute_status(uid)
+        if target_id <= 0:
+            bot.reply_to(message, "Не удалось определить пользователя.")
+            return
 
-    text = (
-        f"Имя пользователя: <i>{html_escape(u[2])}</i>\n"
-        f"Дата подписания контракта: <b>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(u[4] or u[3] or now_ts()))}</b>\n"
-        f"Статус: <b>{html_escape(status)}</b>\n"
-        f"Капитал: <b>{cents_to_money_str(int(u[5] or 0))}</b>$\n"
-        f"Место в топе: <b>{place}</b>"
-    )
-    bot.send_message(message.chat.id, text, parse_mode="HTML")
+        if int(target_id) != int(uid):
+            try:
+                upsert_user(target_id, getattr(target_user, "username", None))
+            except Exception:
+                pass
+
+        if is_banned(target_id):
+            bot.reply_to(message, "У пользователя нет больше профиля.")
+            return
+
+        text = build_profile_summary_text(target_id)
+        if not text:
+            bot.reply_to(message, "У пользователя нет профиля.")
+            return
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton(
+            "Статистика по играм",
+            callback_data=cb_pack(f"profile:gamesview:{target_id}", uid)
+        ))
+
+        bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if message.chat.type != "private":
+        return
+
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+
+    if len(parts) >= 2 and parts[1].strip():
+        target_ref = parts[1].strip()
+
+        if not target_ref.startswith("@"):
+            bot.reply_to(message, "Использование: /profile, /profile @username или ответом на сообщение.")
+            return
+
+        target_un = target_ref[1:].strip()
+        rr = db_one("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (target_un,))
+        if not rr:
+            bot.reply_to(message, "Пользователь не найден в базе.")
+            return
+
+        target_id = int(rr[0])
+
+        if is_banned(target_id):
+            bot.reply_to(message, "У пользователя нет больше профиля.")
+            return
+
+        text = build_profile_summary_text(target_id)
+        if not text:
+            bot.reply_to(message, "У пользователя нет профиля.")
+            return
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton(
+            "Статистика по играм",
+            callback_data=cb_pack(f"profile:gamesview:{target_id}", uid)
+        ))
+
+        bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
+        return
+
+    text = build_profile_summary_text(uid)
+    if not text:
+        return
+
+    kb = build_profile_open_kb(uid)
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
 REPORT_CATS = {
     "bug": "Ошибка бота",
@@ -9332,7 +10047,7 @@ def cmd_pay(message):
     comment = ""
 
     if target_id and is_banned(int(target_id)):
-        bot.reply_to(message, "Переводы этому пользователю больше недоступны. Приносим свои извинения.\nСотрудник НПАО \"Greed\"")
+        bot.reply_to(message, "Переводы этому пользователю больше недоступны. Приносим свои извинения.\nСотрудник КО НПАО \"G®️eed\"")
         return
 
     if message.reply_to_message and len(parts) >= 2 and not parts[1].startswith("@"):
@@ -9345,7 +10060,7 @@ def cmd_pay(message):
         if len(parts) < 3:
             bot.reply_to(
                 message,
-                "Приветсвуем вас в системе быстрых переводов средств КО НПАО \"Greed\"\n"
+                "Приветсвуем вас в системе быстрых переводов средств КО НПАО \"G®️®eed\"\n"
                 "Чтобы воспользоваться услугой, введите: /pay @username сумма [комментарий]\n"
                 "Поддержка перевода по NFS! Достаточно ответить на чужое сообщение и ввести: /pay сумма [комментарий]"
             )
@@ -9409,7 +10124,7 @@ def cmd_pay(message):
                     left = max(0, int(until_ts) - now_ts())
                     bot.reply_to(
                         message,
-                        f"Ваш счёт временно недоступен. Примерное время ожидания <b>{until_txt}</b> (через {_format_duration(left)}). Благодарим вас за понимание. Ваш НПАО \"Greed\"",
+                        f"Ваш счёт временно недоступен. Примерное время ожидания через <b>{_format_duration(left)}</b> (Дата разблокировки <b>{until_txt}</b>). Благодарим вас за понимание. Ваш НПАО \"G®️eed\"",
                         parse_mode="HTML"
                     )
                 else:
@@ -9450,7 +10165,7 @@ def cmd_pay(message):
         f"Перевод выполнен: <b>{cents_to_money_str(int(amt))}</b>$ → <b>{html_escape(tname)}</b>{tun_part}"
         f"{fee_lines}\n"
         f"Ваш баланс: <b>{cents_to_money_str(int(sbal))}</b>$\n"
-        "Благодарим за пользование услугами перевода КО НПАО \"Greed\"",
+        "Благодарим за пользование услугами перевода КО НПАО \"G®️eed\"",
         parse_mode="HTML"
     )
 
@@ -9460,7 +10175,7 @@ def cmd_pay(message):
             f"Вам перевели <b>{cents_to_money_str(int(amt))}</b>$ от <b>{html_escape(sname)}</b>{sun_part}.\n"
             f"Ваш баланс: <b>{cents_to_money_str(int(rbal))}</b>$\n"
             f"{comment_line}\n"
-            "Ваш НПАО \"Greed\"",
+            "Ваш НПАО \"G®️eed\"",
             parse_mode="HTML"
         )
     except Exception:
@@ -9480,55 +10195,17 @@ def cmd_rabs(message):
         return
 
     owner_un = parts[1][1:].strip()
-    rr = db_one("SELECT user_id, short_name, username FROM users WHERE username=? COLLATE NOCASE", (owner_un,))
+    rr = db_one(
+        "SELECT user_id FROM users WHERE username=? COLLATE NOCASE",
+        (owner_un,)
+    )
     if not rr:
         bot.reply_to(message, "Пользователь не найден.")
         return
 
     owner_id = int(rr[0])
-    owner_name = rr[1] or "Без имени"
-    owner_username = rr[2] or ""
-
-    cur.execute("""
-        SELECT slave_id, COALESCE(earned_cents,0), COALESCE(share_bp,0), COALESCE(acquired_ts,0)
-        FROM slavery
-        WHERE owner_id=?
-        ORDER BY COALESCE(earned_cents,0) DESC
-    """, (owner_id,))
-    rows = cur.fetchall() or []
-
-    head_owner_un = f" (@{html_escape(owner_username)})" if owner_username else ""
-    intro = (
-        f"Список рабов пользователя <b>{html_escape(owner_name)}</b>{head_owner_un}\n" 
-    )
-    intro2 = "\n\nЧтобы приобрести раба, используйте /buyrab"
-
-    if not rows:
-        bot.send_message(message.chat.id, intro + "Пусто", parse_mode="HTML")
-        return
-
-    lines = ["Имя|Общий доход|За последнее время|Последнее зачисление"]
-    top = rows[:20]
-    for i, (slave_id, earned_cents, _share_bp, _acquired_ts) in enumerate(top, 1):
-        slave_id = int(slave_id)
-        earned_cents = int(earned_cents or 0)
-        lasth = int(slave_profit_lasth(slave_id, owner_id) or 0)
-        lastp = int(slave_last_credit(slave_id, owner_id) or 0)
-
-        cur.execute("SELECT short_name, username FROM users WHERE user_id=?", (slave_id,))
-        r = cur.fetchone() or (None, None)
-        sname = r[0] or "Без имени"
-        sun = r[1] or ""
-
-        uname_part = f" (@{html_escape(sun)})" if sun else ""
-        lines.append(
-            f"{i}|<b>{html_escape(sname)}</b>{uname_part} "
-            f"<u><b>{cents_to_money_str(earned_cents)}</b>$</u>"
-            f"(<b>{cents_to_money_str(lasth)}</b>$) "
-            f"+ <b>{cents_to_money_str(lastp)}</b>$"
-        )
-
-    bot.send_message(message.chat.id, intro + "\n".join(lines) + intro2, parse_mode="HTML")
+    text, kb = build_rabs_list_text_kb(owner_id, viewer_id)
+    bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="HTML")
 
 @bot.message_handler(commands=["buyrab"])
 def cmd_buyrab(message):
@@ -9889,5 +10566,13 @@ while True:
     try:
         bot.infinity_polling(skip_pending=True, timeout=10, long_polling_timeout=20)
     except Exception as e:
-        print("polling crashed:", repr(e))
+        try:
+            print("polling crashed:", repr(e))
+        except Exception:
+            pass
+
+        try:
+            send_error_report("infinity_polling", e)
+        except Exception:
+            pass
         time.sleep(5)
