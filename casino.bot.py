@@ -9743,9 +9743,6 @@ def cmd_profile(message):
         bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
         return
 
-    if message.chat.type != "private":
-        return
-
     raw = (message.text or "").strip()
     parts = raw.split(maxsplit=1)
 
