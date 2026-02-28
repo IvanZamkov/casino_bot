@@ -411,6 +411,31 @@ CREATE TABLE IF NOT EXISTS users (
 """)
 
 cur.execute("""
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_id INTEGER PRIMARY KEY,
+  pm_notify INTEGER NOT NULL DEFAULT 1,
+  auto_delete_pm INTEGER NOT NULL DEFAULT 1,
+  settings_msg_id INTEGER NOT NULL DEFAULT 0
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS pm_bot_messages (
+  chat_id INTEGER NOT NULL,
+  message_id INTEGER NOT NULL,
+  created_ts INTEGER NOT NULL,
+  delete_after_ts INTEGER NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (chat_id, message_id)
+)
+""")
+
+cur.execute("""
+CREATE INDEX IF NOT EXISTS idx_pm_bot_messages_gc
+ON pm_bot_messages(deleted, delete_after_ts)
+""")
+
+cur.execute("""
 CREATE TABLE IF NOT EXISTS reg_state (
   user_id INTEGER PRIMARY KEY,
   stage TEXT,           -- 'await_open' | 'await_name' | NULL
@@ -569,6 +594,7 @@ CREATE TABLE IF NOT EXISTS buyrab_offer_resp (
 )
 """)
 
+# WORK
 cur.execute("""
 CREATE TABLE IF NOT EXISTS work_stats (
   user_id INTEGER,
@@ -604,6 +630,7 @@ CREATE TABLE IF NOT EXISTS work_history (
 )
 """)
 
+# SHOP
 cur.execute("""
 CREATE TABLE IF NOT EXISTS shop_inv (
     user_id INTEGER NOT NULL,
@@ -663,6 +690,7 @@ CREATE TABLE IF NOT EXISTS shop_catalog (
 )
 """)
 
+# GAMES
 cur.execute("""
 CREATE TABLE IF NOT EXISTS games (
   game_id TEXT PRIMARY KEY,
@@ -796,6 +824,7 @@ CREATE TABLE IF NOT EXISTS demon_streak (
 )
 """)
 
+# ПРОЧЕЕ 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS credit_loans (
   user_id INTEGER PRIMARY KEY,
@@ -1064,6 +1093,204 @@ cur = CurProxy()
 # Helpers
 def now_ts() -> int:
     return int(time.time())
+
+PM_AUTO_DELETE_SEC = 48 * 3600 # таймер авто-удаления
+
+def ensure_user_settings(uid: int):
+    db_exec(
+        "INSERT OR IGNORE INTO user_settings (user_id, pm_notify, auto_delete_pm, settings_msg_id) VALUES (?,?,?,?)",
+        (int(uid), 1, 1, 0),
+        commit=True
+    )
+
+def _user_settings_row(uid: int) -> Tuple[int, int, int]:
+    row = db_one(
+        "SELECT pm_notify, auto_delete_pm, settings_msg_id FROM user_settings WHERE user_id=?",
+        (int(uid),)
+    )
+    if not row:
+        return (1, 1, 0)
+    return (int(row[0] or 0), int(row[1] or 0), int(row[2] or 0))
+
+def user_pm_notifications_enabled(uid: int) -> bool:
+    row = db_one("SELECT pm_notify FROM user_settings WHERE user_id=?", (int(uid),))
+    if not row:
+        return True
+    return bool(int(row[0] or 0))
+
+def user_auto_delete_pm_enabled(uid: int) -> bool:
+    row = db_one("SELECT auto_delete_pm FROM user_settings WHERE user_id=?", (int(uid),))
+    if not row:
+        return True
+    return bool(int(row[0] or 0))
+
+def set_user_pm_notify(uid: int, enabled: bool):
+    ensure_user_settings(uid)
+    db_exec(
+        "UPDATE user_settings SET pm_notify=? WHERE user_id=?",
+        (1 if enabled else 0, int(uid)),
+        commit=True
+    )
+
+def set_user_auto_delete_pm(uid: int, enabled: bool):
+    ensure_user_settings(uid)
+    db_exec(
+        "UPDATE user_settings SET auto_delete_pm=? WHERE user_id=?",
+        (1 if enabled else 0, int(uid)),
+        commit=True
+    )
+
+def get_settings_msg_id(uid: int) -> int:
+    row = db_one("SELECT settings_msg_id FROM user_settings WHERE user_id=?", (int(uid),))
+    return int((row[0] if row else 0) or 0)
+
+def set_settings_msg_id(uid: int, msg_id: int):
+    ensure_user_settings(uid)
+    db_exec(
+        "UPDATE user_settings SET settings_msg_id=? WHERE user_id=?",
+        (int(msg_id or 0), int(uid)),
+        commit=True
+    )
+
+def _settings_onoff(v: bool) -> str:
+    return "Включено ✅" if v else "Выключено ❌"
+
+def _settings_menu_text(uid: int) -> str:
+    pm_notify, auto_del, _msg_id = _user_settings_row(uid)
+    return (
+        "⚙️ Настройки бота\n\n"
+        f"Уведомления в ЛС: {_settings_onoff(bool(pm_notify))}\n"
+        f"Автоудаление сообщений: {_settings_onoff(bool(auto_del))}"
+    )
+
+def _settings_menu_kb(uid: int) -> InlineKeyboardMarkup:
+    pm_notify, auto_del, _msg_id = _user_settings_row(uid)
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton(
+        f"Уведомления в ЛС: {'✅' if pm_notify else '❌'}",
+        callback_data=cb_pack("settings:toggle:pmnotify", uid)
+    ))
+    kb.add(InlineKeyboardButton(
+        f"Автоудаление 48ч: {'✅' if auto_del else '❌'}",
+        callback_data=cb_pack("settings:toggle:autodel", uid)
+    ))
+    return kb
+
+def show_settings_menu(chat_id: int, uid: int, prefer_edit: bool = True):
+    uid = int(uid)
+    chat_id = int(chat_id)
+    ensure_user_settings(uid)
+
+    if chat_id != uid:
+        text = "Настройки доступны в личных сообщениях бота."
+        if BOT_USERNAME:
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton(
+                "Открыть настройки",
+                url=f"https://t.me/{BOT_USERNAME}?start=settings"
+            ))
+            bot.send_message(chat_id, text, reply_markup=kb)
+        else:
+            bot.send_message(chat_id, text)
+        return
+
+    msg_id = get_settings_msg_id(uid)
+    text = _settings_menu_text(uid)
+    kb = _settings_menu_kb(uid)
+
+    if prefer_edit and msg_id:
+        try:
+            bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=kb)
+            return
+        except Exception:
+            pass
+
+    sent = bot.send_message(chat_id, text, reply_markup=kb)
+    set_settings_msg_id(uid, int(sent.message_id))
+
+def _track_private_bot_message(sent_msg):
+    try:
+        if not sent_msg:
+            return
+        chat = getattr(sent_msg, "chat", None)
+        if not chat:
+            return
+        if str(getattr(chat, "type", "") or "") != "private":
+            return
+
+        chat_id = int(getattr(chat, "id", 0) or 0)
+        msg_id = int(getattr(sent_msg, "message_id", 0) or 0)
+        if chat_id <= 0 or msg_id <= 0:
+            return
+
+        db_exec(
+            "INSERT OR REPLACE INTO pm_bot_messages (chat_id, message_id, created_ts, delete_after_ts, deleted) VALUES (?,?,?,?,0)",
+            (chat_id, msg_id, now_ts(), now_ts() + PM_AUTO_DELETE_SEC),
+            commit=True
+        )
+    except Exception:
+        pass
+
+def _delete_tracked_pm_message(chat_id: int, msg_id: int) -> bool:
+    try:
+        bot.delete_message(int(chat_id), int(msg_id))
+        db_exec(
+            "UPDATE pm_bot_messages SET deleted=1 WHERE chat_id=? AND message_id=?",
+            (int(chat_id), int(msg_id)),
+            commit=True
+        )
+        return True
+    except Exception:
+        return False
+
+def _pm_autodelete_daemon():
+    while True:
+        try:
+            rows = db_all(
+                "SELECT chat_id, message_id FROM pm_bot_messages "
+                "WHERE deleted=0 AND delete_after_ts<=? "
+                "ORDER BY delete_after_ts ASC LIMIT 200",
+                (now_ts(),)
+            ) or []
+
+            for chat_id, msg_id in rows:
+                chat_id = int(chat_id)
+                msg_id = int(msg_id)
+
+                if not user_auto_delete_pm_enabled(chat_id):
+                    continue
+
+                _delete_tracked_pm_message(chat_id, msg_id)
+                time.sleep(0.03)
+        except Exception:
+            send_error_report("_pm_autodelete_daemon")
+
+        time.sleep(30)
+
+# логируем новые исходящие ЛС-сообщения бота
+_ORIG_SEND_MESSAGE = bot.send_message
+_ORIG_SEND_PHOTO = bot.send_photo
+_ORIG_SEND_VIDEO = bot.send_video
+
+def _tracked_send_message(*args, **kwargs):
+    sent = _ORIG_SEND_MESSAGE(*args, **kwargs)
+    _track_private_bot_message(sent)
+    return sent
+
+def _tracked_send_photo(*args, **kwargs):
+    sent = _ORIG_SEND_PHOTO(*args, **kwargs)
+    _track_private_bot_message(sent)
+    return sent
+
+def _tracked_send_video(*args, **kwargs):
+    sent = _ORIG_SEND_VIDEO(*args, **kwargs)
+    _track_private_bot_message(sent)
+    return sent
+
+bot.send_message = _tracked_send_message
+bot.send_photo = _tracked_send_photo
+bot.send_video = _tracked_send_video
 
 def money_to_cents(x: str) -> Optional[int]:
     """
@@ -1557,6 +1784,33 @@ def load_contract_text() -> str:
     with open(CONTRACT_PATH, "r", encoding="utf-8") as f:
         return f.read()
 
+def render_contract_for_user(uid: int) -> Optional[str]:
+    u = get_user(int(uid))
+    if not u or not u[2]:
+        return None
+
+    signed_ts = int(u[4] or u[3] or now_ts())
+
+    rendered = safe_format(
+        load_contract_text(),
+        name=html_escape(u[2] or ""),
+        username=html_escape(u[1] or ""),
+        date=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(signed_ts)),
+        user_id=str(int(uid)),
+    )
+
+    lines = rendered.splitlines()
+    if not lines:
+        return rendered
+
+    head = lines[0]
+    tail = "\n".join(lines[1:]).strip()
+
+    if not tail:
+        return head
+
+    return f"{head}\n\n<blockquote expandable>{tail}</blockquote>"
+
 def upsert_user(uid: int, username: Optional[str]):
     db_exec("""
     INSERT INTO users (user_id, username, created_ts)
@@ -2022,7 +2276,7 @@ def _mail_letter_text(kind: str, amount_cents: int) -> str:
     if kind == "intro":
         body = "Ваш доброжелатель очень рад вашему вниманию и, в качестве поощрения будет раз в день высылать вам подарок."
     else:
-        body = "Анонимный доброжелатель заметил вашу отдачу. Примите в качестве его благодарности скромный подарок."
+        body = "Финансовая помощь от анонимного доброжелателя."
 
     return (
         f"{html_escape(body)}\n"
@@ -2068,16 +2322,10 @@ def _mail_daemon():
                     cur.execute("UPDATE daily_mail SET next_ts=?, intro_sent=1 WHERE user_id=?", (now + MAIL_PERIOD_SEC, uid))
                     conn.commit()
                     try:
-                        _send_mail_prompt(uid, kind, amt)
-                    except Exception:
-                        pass
-                else:
-                    kind = "std"
-                    amt = 40000
-                    cur.execute("UPDATE daily_mail SET next_ts=? WHERE user_id=?", (now + MAIL_PERIOD_SEC, uid))
-                    conn.commit()
-                    try:
-                        _send_mail_prompt(uid, kind, amt)
+                        if user_pm_notifications_enabled(uid):
+                            _send_mail_prompt(uid, kind, amt)
+                        else:
+                            add_balance(uid, amt)
                     except Exception:
                         pass
         except Exception:
@@ -4099,6 +4347,35 @@ def on_mail_open(call: CallbackQuery):
 
     bot.answer_callback_query(call.id)
 
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("settings:toggle:"))
+def on_settings_toggle(call: CallbackQuery):
+    base, owner = cb_unpack(call.data)
+    uid = call.from_user.id
+
+    if owner is not None and owner != uid:
+        bot.answer_callback_query(call.id, "Вы не можете нажать на эту кнопку", show_alert=True)
+        return
+
+    ensure_user_settings(uid)
+
+    what = base.split(":", 2)[2] if ":" in base else ""
+
+    if what == "pmnotify":
+        set_user_pm_notify(uid, not user_pm_notifications_enabled(uid))
+    elif what == "autodel":
+        set_user_auto_delete_pm(uid, not user_auto_delete_pm_enabled(uid))
+    else:
+        bot.answer_callback_query(call.id, "Неизвестная настройка.", show_alert=True)
+        return
+
+    try:
+        if getattr(call, "message", None):
+            set_settings_msg_id(uid, int(call.message.message_id))
+            show_settings_menu(call.message.chat.id, uid, prefer_edit=True)
+        bot.answer_callback_query(call.id)
+    except Exception:
+        bot.answer_callback_query(call.id, "Не удалось обновить настройки.", show_alert=True)
+
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("dealpm:"))
 def on_dealpm_callbacks(call: CallbackQuery):
     base, owner = cb_unpack(call.data)
@@ -4737,6 +5014,10 @@ def cmd_start(message):
 
         payload = "contract"
 
+    if payload == "settings":
+        show_settings_menu(message.chat.id, uid, prefer_edit=True)
+        return
+
     if payload != "contract":
         return
 
@@ -4754,6 +5035,13 @@ def cmd_start(message):
     kb.add(InlineKeyboardButton("Подписать", callback_data=cb_pack("reg:sign", uid)))
     sent = bot.send_message(message.chat.id, text, reply_markup=kb)
     set_reg_state(uid, "await_name", sent.message_id)
+
+@bot.message_handler(commands=["settings"])
+def cmd_settings(message):
+    uid = message.from_user.id
+    username = getattr(message.from_user, "username", None)
+    upsert_user(uid, username)
+    show_settings_menu(message.chat.id, uid, prefer_edit=True)
 
 # REGISTRATION callbacks
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("reg:"))
@@ -5074,6 +5362,20 @@ def on_main_callbacks(call: CallbackQuery):
         edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
         bot.answer_callback_query(call.id)
         return
+    
+    if kind == "profile" and parts[1] == "contract":
+        text = render_contract_for_user(clicker)
+        if not text:
+            edit_inline_or_message(call, "Контракт ещё не подписан.", reply_markup=None, parse_mode="HTML")
+            bot.answer_callback_query(call.id)
+            return
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("Назад в профиль", callback_data=cb_pack("profile:open", clicker)))
+
+        edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
 
     if kind == "profile" and parts[1] == "open":
         u = get_user(clicker)
@@ -5130,6 +5432,7 @@ def on_main_callbacks(call: CallbackQuery):
             "ㅤ☛ разблокировка /udblockcash\n"
             "ㅤ☛ блокировка /blockcash\n"
             "☛ работа /work"
+            "☛ чистка чатов /clearpm\n"
         )
 
         kb = InlineKeyboardMarkup()
@@ -8628,7 +8931,7 @@ def build_profile_open_kb(uid: int) -> InlineKeyboardMarkup:
 
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("Статистика по играм", callback_data=cb_pack("profile:games", uid)))
-
+    kb.add(InlineKeyboardButton("Контракт", callback_data=cb_pack("profile:contract", uid)))
     if uid == OWNER_ID:
         kb.add(InlineKeyboardButton("Команды", callback_data=cb_pack("profile:commands", uid)))
     if credit_has_active(uid):
@@ -9112,8 +9415,10 @@ def _work_daemon():
             send_error_report("_work_daemon")
         time.sleep(2)
 
+# Димоны
 threading.Thread(target=_work_daemon, daemon=True).start()
 threading.Thread(target=_mail_daemon, daemon=True).start()
+threading.Thread(target=_pm_autodelete_daemon, daemon=True).start()
 
 @bot.message_handler(commands=["human"])
 def cmd_human(message):
@@ -9158,11 +9463,9 @@ def cmd_finance(message):
         mode = "single"
         uname = parts[1][1:]
         amt_token = parts[2]
-
     elif len(parts) >= 2:
         mode = "all"
         amt_token = parts[1]
-
     else:
         bot.reply_to(
             message,
@@ -9190,19 +9493,24 @@ def cmd_finance(message):
         uid = int(r[0])
 
         try:
-            ensure_daily_mail_row(uid)
-            _send_mail_prompt(uid, f"owner_finance|{payload}", int(amt))
+            if user_pm_notifications_enabled(uid):
+                ensure_daily_mail_row(uid)
+                _send_mail_prompt(uid, f"owner_finance|{payload}", int(amt))
+                bot.reply_to(
+                    message,
+                    f"Письмо отправлено пользователю @{uname} с суммой в размере {cents_to_money_str(amt)}$"
+                )
+            else:
+                add_balance(uid, int(amt))
+                bot.reply_to(
+                    message,
+                    f"Пользователю @{uname} сразу зачислено {cents_to_money_str(amt)}$ "
+                    f"(уведомления в ЛС отключены)."
+                )
         except Exception:
-            bot.reply_to(message, "Не удалось отправить письмо пользователю.")
-            return
-
-        bot.reply_to(
-            message,
-            f"Письмо отправлено пользователю @{uname} с суммой в размере {cents_to_money_str(amt)}$"
-        )
+            bot.reply_to(message, "Не удалось выполнить перевод.")
         return
 
-    # Массовая рассылка
     rows = db_all(
         "SELECT user_id FROM users WHERE COALESCE(contract_ts,0) > 0 ORDER BY user_id"
     )
@@ -9210,22 +9518,28 @@ def cmd_finance(message):
         bot.reply_to(message, "В базе нет зарегистрированных пользователей для рассылки.")
         return
 
-    sent = 0
+    mailed = 0
+    instant = 0
     failed = 0
 
     for (uid,) in rows:
         uid = int(uid)
         try:
-            ensure_daily_mail_row(uid)
-            _send_mail_prompt(uid, f"owner_finance|{payload}", int(amt))
-            sent += 1
+            if user_pm_notifications_enabled(uid):
+                ensure_daily_mail_row(uid)
+                _send_mail_prompt(uid, f"owner_finance|{payload}", int(amt))
+                mailed += 1
+            else:
+                add_balance(uid, int(amt))
+                instant += 1
         except Exception:
             failed += 1
 
     bot.reply_to(
         message,
         "Массовая рассылка завершена.\n"
-        f"Отправлено: {sent}\n"
+        f"Писем отправлено: {mailed}\n"
+        f"Сразу зачислено без ЛС: {instant}\n"
         f"Ошибок: {failed}\n"
         f"Сумма каждому: {cents_to_money_str(amt)}$"
     )
@@ -9727,12 +10041,17 @@ def cmd_remessage(message):
             time.sleep(0.02)
 
         time.sleep(0.05)
-
+    
     sent = 0
     failed = 0
+    skipped_no_pm = 0
 
     for uid in uids:
         if uid in covered_uids:
+            continue
+
+        if not user_pm_notifications_enabled(int(uid)):
+            skipped_no_pm += 1
             continue
 
         if _send_with_retry(int(uid), body):
@@ -9750,6 +10069,7 @@ def cmd_remessage(message):
         f"Проверено групп: {group_checked}\n"
         f"Покрыто через группы: {len(covered_uids)}\n"
         f"Личных отправок: {sent}\n"
+        f"Пропущено из-за настроек ЛС: {skipped_no_pm}\n"
         f"Ошибок в ЛС: {failed}"
     )
 
@@ -9825,6 +10145,37 @@ def cmd_chatlist(message):
         )
 
     bot.send_message(message.chat.id, "\n\n".join(lines), parse_mode="HTML")
+
+@bot.message_handler(commands=["clearpm"])
+def cmd_clearpm(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    if message.chat.type != "private":
+        return
+
+    rows = db_all(
+        "SELECT chat_id, message_id FROM pm_bot_messages WHERE deleted=0 ORDER BY created_ts ASC",
+        ()
+    ) or []
+
+    if not rows:
+        bot.reply_to(message, "Нет отслеживаемых ЛС-сообщений для очистки.")
+        return
+
+    ok = 0
+    fail = 0
+
+    for chat_id, msg_id in rows:
+        if _delete_tracked_pm_message(int(chat_id), int(msg_id)):
+            ok += 1
+        else:
+            fail += 1
+        time.sleep(0.03)
+
+    bot.reply_to(
+        message,
+        f"Очистка ЛС завершена.\nУдалено: {ok}\nНе удалось удалить: {fail}"
+    )
 
 @bot.message_handler(commands=["del"])
 def cmd_del(message):
