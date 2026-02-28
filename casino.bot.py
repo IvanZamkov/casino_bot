@@ -5112,6 +5112,7 @@ def on_main_callbacks(call: CallbackQuery):
             "Список команд модерирования\n\n"
             "☛ профиль /profile\n"
             "☛ рассылка /remessage\n"
+            "☛ чаты /chatlist\n"
             "Статусы ☚\n"
             "☛ кастомный /addstatus\n"
             "☛ демон /devil\n"
