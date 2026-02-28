@@ -9470,6 +9470,129 @@ def cmd_remessage(message):
         f"Ошибок в ЛС: {failed}\n"
         f"Проверено групп: {group_checked}"
     )
+def cmd_remessage(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    if message.chat.type != "private":
+        return
+
+    raw = message.text or ""
+    if "\n" not in raw:
+        bot.reply_to(
+            message,
+            "Использование:\n"
+            "/remessage\n"
+            "<текст рассылки с HTML-разметкой>"
+        )
+        return
+
+    _cmd, body = raw.split("\n", 1)
+    body = (body or "").strip("\n")
+    if not body.strip():
+        bot.reply_to(message, "Текст рассылки пуст.")
+        return
+
+    rows = db_all("SELECT user_id FROM users WHERE COALESCE(contract_ts,0) > 0", ())
+    uids = [int(r[0]) for r in (rows or []) if r and str(r[0]).isdigit()]
+
+    if not uids:
+        bot.reply_to(message, "Нет зарегистрированных пользователей для рассылки.")
+        return
+
+    def _parse_retry_after(exc: Exception) -> float:
+        s = str(exc)
+        m = re.search(r"retry after (\d+(?:\.\d+)?)", s, re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                return 0.0
+        return 0.0
+
+    def _send_with_retry(chat_id: int, text: str) -> bool:
+        try:
+            bot.send_message(int(chat_id), text, parse_mode="HTML")
+            return True
+        except Exception as e:
+            ra = _parse_retry_after(e)
+            if ra and ra > 0:
+                time.sleep(ra + 0.2)
+                try:
+                    bot.send_message(int(chat_id), text, parse_mode="HTML")
+                    return True
+                except Exception:
+                    return False
+            return False
+
+    group_sent = 0
+    group_failed = 0
+    group_checked = 0
+
+    bot_me_id = 0
+    try:
+        if ME:
+            bot_me_id = int(getattr(ME, "id", 0) or 0)
+    except Exception:
+        bot_me_id = 0
+
+    if bot_me_id <= 0:
+        try:
+            me = bot.get_me()
+            bot_me_id = int(getattr(me, "id", 0) or 0)
+        except Exception:
+            bot_me_id = 0
+
+    group_ids = get_known_broadcast_group_ids()
+
+    for chat_id in group_ids:
+        group_checked += 1
+
+        try:
+            if bot_me_id > 0:
+                me_member = bot.get_chat_member(int(chat_id), int(bot_me_id))
+                me_status = str(getattr(me_member, "status", "") or "")
+                if me_status in ("left", "kicked"):
+                    continue
+            else:
+                bot.get_chat(int(chat_id))
+        except Exception:
+            continue
+
+        if _send_with_retry(int(chat_id), body):
+            group_sent += 1
+        else:
+            group_failed += 1
+
+        time.sleep(0.05)
+
+    if group_sent > 0:
+        bot.reply_to(
+            message,
+            "Рассылка завершена.\n"
+            f"Групповых отправок: {group_sent}\n"
+            f"Ошибок по группам: {group_failed}\n"
+            "Личные сообщения не отправлялись, так как рассылка ушла в групповые чаты."
+        )
+        return
+
+    sent = 0
+    failed = 0
+
+    for uid in uids:
+        if _send_with_retry(int(uid), body):
+            sent += 1
+        else:
+            failed += 1
+        time.sleep(0.03)
+
+    bot.reply_to(
+        message,
+        "Рассылка завершена.\n"
+        f"Групповых отправок: 0\n"
+        f"Проверено групп: {group_checked}\n"
+        f"Личных отправок: {sent}\n"
+        f"Ошибок в ЛС: {failed}"
+    )
 
 @bot.message_handler(commands=["del"])
 def cmd_del(message):
