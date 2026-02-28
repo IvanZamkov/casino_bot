@@ -2136,7 +2136,7 @@ SHOP_ITEM_COOLDOWN_SEC = {
 }
 
 SHOP_STACKABLE_ZERO_ITEMS = {"black_chip", "red_chip"}
-SHOP_STACK_MAX = 3
+SHOP_STACK_MAX = 3 # стак фишек
 
 def shop_get_item_next_ts(uid: int, key: str) -> int:
     r = db_one(
@@ -2529,14 +2529,13 @@ def shop_activate(uid: int, key: str) -> tuple[bool, str]:
         return False, f"Следующая активация через <b>{_format_duration(left)}</b> (<b>{nxt_txt}</b>)."
 
     item = SHOP_ITEMS[key]
-    have = shop_get_qty(uid, key)
+    have = int(shop_get_qty(uid, key) or 0)
     if have <= 0:
         return False, "У тебя нет этого предмета."
 
     active = shop_get_active(uid)
     active_now = int(active.get(key, 0) or 0)
 
-    # Красная/чёрная фишки: стакаются до 3 раз
     if key in SHOP_STACKABLE_ZERO_ITEMS:
         if active_now >= SHOP_STACK_MAX:
             cd = int(SHOP_ITEM_COOLDOWN_SEC.get(key, 0) or 0)
@@ -2544,8 +2543,15 @@ def shop_activate(uid: int, key: str) -> tuple[bool, str]:
                 shop_set_item_next_ts(uid, key, now_ts() + cd)
             return False, "Достигнут максимальный стак этого эффекта."
 
-        new_stack = active_now + 1
-        shop_set_qty(uid, key, have - 1)
+        free_slots = max(0, SHOP_STACK_MAX - active_now)
+        to_consume = min(have, free_slots, SHOP_STACK_MAX)
+
+        if to_consume <= 0:
+            return False, "Нечего активировать."
+
+        new_stack = active_now + to_consume
+
+        shop_set_qty(uid, key, have - to_consume)
         shop_set_active(uid, key, new_stack)
 
         if new_stack >= SHOP_STACK_MAX:
@@ -2553,16 +2559,17 @@ def shop_activate(uid: int, key: str) -> tuple[bool, str]:
             if cd > 0:
                 shop_set_item_next_ts(uid, key, now_ts() + cd)
 
-        return True, f"Активировано. Текущий стак: {new_stack}/{SHOP_STACK_MAX}."
+        return True, (
+            f"Активировано. Списано: {to_consume}. "
+            f"Текущий стак: {new_stack}/{SHOP_STACK_MAX}."
+        )
 
-    # Обычные предметы
     if key in active and active_now > 0:
         return False, "Этот эффект уже активен."
 
     shop_set_qty(uid, key, have - 1)
     shop_set_active(uid, key, int(item["duration_games"]))
 
-    # Индивидуальный откат для предметов с кулдауном
     if key in ("insurance", "paket"):
         cd = int(SHOP_ITEM_COOLDOWN_SEC.get(key, 0) or 0)
         if cd > 0:
@@ -2710,18 +2717,27 @@ def shop_item_kb(uid: int, key: str) -> InlineKeyboardMarkup:
 
     kb.add(InlineKeyboardButton("Купить", callback_data=cb_pack(f"shop:buy:{key}", uid)))
 
-    can_activate = (shop_get_qty(uid, key) > 0) and (shop_get_active(uid).get(key, 0) <= 0)
+    qty = int(shop_get_qty(uid, key) or 0)
+    active_now = int(shop_get_active(uid).get(key, 0) or 0)
+    can_activate = False
 
-    if can_activate and key in ("insurance", "paket"):
-        if shop_item_cooldown_left(uid) > 0:
-            can_activate = False
+    if qty > 0:
+        # Для красной/чёрной фишек разрешаем дожимать стак до 3
+        if key in SHOP_STACKABLE_ZERO_ITEMS:
+            can_activate = (active_now < SHOP_STACK_MAX)
+            if can_activate and shop_item_cooldown_left(uid, key) > 0:
+                can_activate = False
+        else:
+            can_activate = (active_now <= 0)
+            if can_activate and key in ("insurance", "paket"):
+                if shop_item_cooldown_left(uid, key) > 0:
+                    can_activate = False
 
     if can_activate:
         kb.add(InlineKeyboardButton("Активировать", callback_data=cb_pack(f"shop:act:{key}", uid)))
 
     kb.add(InlineKeyboardButton("Назад", callback_data=cb_pack("shop:open", uid)))
     return kb
-
 # Шанс раба для Страховки и Пакета
 SLAVE_RISK_BASE_PCT = 15 #начальный %
 SLAVE_RISK_STEP_PCT = 10 #добавочный % после каждого использования
