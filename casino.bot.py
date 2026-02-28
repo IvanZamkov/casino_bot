@@ -1153,7 +1153,7 @@ def set_settings_msg_id(uid: int, msg_id: int):
     )
 
 def _settings_onoff(v: bool) -> str:
-    return "Включено ✅" if v else "Выключено ❌"
+    return "✅" if v else "❌"
 
 def _settings_menu_text(uid: int) -> str:
     pm_notify, auto_del, _msg_id = _user_settings_row(uid)
@@ -4878,6 +4878,7 @@ def on_inline(q: InlineQuery):
 
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("Статистика по играм", callback_data=cb_pack("profile:games", uid)))
+        kb.add(InlineKeyboardButton("Контракт", callback_data=cb_pack("profile:contract", uid)))
         if uid == OWNER_ID:
             kb.add(InlineKeyboardButton("Команды", callback_data=cb_pack("profile:commands", uid)))
         if credit_has_active(uid):
