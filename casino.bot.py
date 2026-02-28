@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from html import escape as html_escape
 from typing import Optional, List, Tuple, Dict
 from telebot import TeleBot
+from telebot.handler_backends import ContinueHandling
 from telebot.types import (
     InlineQuery,
     InlineQueryResultArticle,
@@ -1107,6 +1108,41 @@ def remember_group_chat(chat_id: int, title: str = "") -> None:
 
 def forget_group_chat(chat_id: int) -> None:
     db_exec("DELETE FROM known_group_chats WHERE chat_id=?", (int(chat_id),), commit=True)
+
+def _touch_group_from_message(message) -> None:
+    try:
+        chat = getattr(message, "chat", None)
+        if chat and getattr(chat, "type", "") in ("group", "supergroup"):
+            remember_group_chat(int(chat.id), getattr(chat, "title", "") or "")
+    except Exception:
+        pass
+
+def _touch_group_from_callback(call: CallbackQuery) -> None:
+    try:
+        msg = getattr(call, "message", None)
+        chat = getattr(msg, "chat", None) if msg else None
+        if chat and getattr(chat, "type", "") in ("group", "supergroup"):
+            remember_group_chat(int(chat.id), getattr(chat, "title", "") or "")
+    except Exception:
+        pass
+
+@bot.message_handler(
+    func=lambda m: True,
+    content_types=[
+        "text", "photo", "audio", "document", "animation", "game",
+        "video", "voice", "video_note", "location", "contact",
+        "sticker", "venue", "dice", "new_chat_members",
+        "left_chat_member", "pinned_message"
+    ]
+)
+def _track_any_group_message(message):
+    _touch_group_from_message(message)
+    return ContinueHandling()
+
+@bot.callback_query_handler(func=lambda c: True)
+def _track_any_group_callback(call: CallbackQuery):
+    _touch_group_from_callback(call)
+    return ContinueHandling()
 
 def get_known_broadcast_group_ids() -> List[int]:
     """
@@ -4088,7 +4124,7 @@ def on_dealpm_callbacks(call: CallbackQuery):
         open_hint = f"@{BOT_USERNAME}" if BOT_USERNAME else "ботом"
         bot.answer_callback_query(
             call.id,
-            f"Сначала откройте личные сообщения с {open_hint} и нажмите /start.",
+            f"Первым делом запустите {open_hint}",
             show_alert=True
         )
         return
@@ -4133,7 +4169,13 @@ def on_bot_left_group(message):
 
 def compute_group_key_from_callback(call: CallbackQuery, prefix_len=PREFIX_LEN) -> Optional[str]:
     if getattr(call, "message", None) and getattr(call.message, "chat", None):
+        try:
+            if getattr(call.message.chat, "type", "") in ("group", "supergroup"):
+                remember_group_chat(int(call.message.chat.id), getattr(call.message.chat, "title", "") or "")
+        except Exception:
+            pass
         return f"chat:{call.message.chat.id}"
+
     inline_id = getattr(call, "inline_message_id", None)
     if inline_id:
         return f"inline_pref:{inline_id[:prefix_len]}"
@@ -9666,17 +9708,6 @@ def cmd_remessage(message):
 
         time.sleep(0.05)
 
-    if group_sent > 0:
-        bot.reply_to(
-            message,
-            "Рассылка завершена.\n"
-            f"Групповых отправок: {group_sent}\n"
-            f"Ошибок по группам: {group_failed}\n"
-            f"Проверено групп: {group_checked}\n"
-            "Личные сообщения не отправлялись."
-        )
-        return
-
     sent = 0
     failed = 0
 
@@ -9690,12 +9721,85 @@ def cmd_remessage(message):
     bot.reply_to(
         message,
         "Рассылка завершена.\n"
-        f"Групповых отправок: 0\n"
+        f"Групповых отправок: {group_sent}\n"
         f"Ошибок по группам: {group_failed}\n"
         f"Проверено групп: {group_checked}\n"
         f"Личных отправок: {sent}\n"
         f"Ошибок в ЛС: {failed}"
     )
+
+@bot.message_handler(commands=["chatlist"])
+def cmd_chatlist(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    if message.chat.type != "private":
+        return
+
+    rows = db_all(
+        "SELECT chat_id, COALESCE(title,''), COALESCE(last_seen_ts,0) "
+        "FROM known_group_chats "
+        "WHERE chat_id < 0 "
+        "ORDER BY last_seen_ts DESC, added_ts DESC, chat_id ASC",
+        ()
+    ) or []
+
+    if not rows:
+        bot.reply_to(message, "Список известных групп пуст.")
+        return
+
+    try:
+        if ME:
+            bot_me_id = int(getattr(ME, "id", 0) or 0)
+        else:
+            me = bot.get_me()
+            bot_me_id = int(getattr(me, "id", 0) or 0)
+    except Exception:
+        bot_me_id = 0
+
+    lines = ["Известные групповые чаты:"]
+
+    for chat_id, saved_title, last_seen_ts in rows:
+        chat_id = int(chat_id or 0)
+        title = str(saved_title or "").strip()
+        present = True
+
+        try:
+            present = bot_is_present_in_group(chat_id, bot_me_id=bot_me_id)
+        except Exception:
+            present = True
+
+        if not present:
+            status = "не найден"
+        else:
+            status = "ok"
+
+        try:
+            ch = bot.get_chat(chat_id)
+            fresh_title = str(getattr(ch, "title", "") or "").strip()
+            if fresh_title:
+                title = fresh_title
+                remember_group_chat(chat_id, fresh_title)
+        except Exception:
+            pass
+
+        if not title:
+            title = "(без названия)"
+
+        seen_txt = "-"
+        try:
+            if int(last_seen_ts or 0) > 0:
+                seen_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(last_seen_ts)))
+        except Exception:
+            seen_txt = str(last_seen_ts)
+
+        lines.append(
+            f"• <b>{html_escape(title)}</b>\n"
+            f"ID: <code>{chat_id}</code>\n"
+            f"Статус: <i>{status}</i>\n"
+            f"Последняя активность: <i>{html_escape(seen_txt)}</i>"
+        )
+
+    bot.send_message(message.chat.id, "\n\n".join(lines), parse_mode="HTML")
 
 @bot.message_handler(commands=["del"])
 def cmd_del(message):
