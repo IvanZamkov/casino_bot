@@ -822,6 +822,15 @@ CREATE TABLE IF NOT EXISTS transfers (
 """)
 
 cur.execute("""
+CREATE TABLE IF NOT EXISTS known_group_chats (
+  chat_id INTEGER PRIMARY KEY,
+  title TEXT DEFAULT '',
+  added_ts INTEGER NOT NULL DEFAULT 0,
+  last_seen_ts INTEGER NOT NULL DEFAULT 0
+)
+""")
+
+cur.execute("""
 CREATE TABLE IF NOT EXISTS transfer_blocks (
   user_id INTEGER PRIMARY KEY,
   until_ts INTEGER NOT NULL,
@@ -880,6 +889,16 @@ CREATE TABLE IF NOT EXISTS report_state (
   category TEXT NOT NULL,
   stage TEXT NOT NULL,
   created_ts INTEGER NOT NULL
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS pm_trade_state (
+  user_id INTEGER PRIMARY KEY,
+  action TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '',
+  stage TEXT NOT NULL DEFAULT 'ready',
+  created_ts INTEGER NOT NULL DEFAULT 0
 )
 """)
 
@@ -1072,6 +1091,79 @@ def safe_format(template: str, **kwargs) -> str:
             return "{" + key + "}"
     return template.format_map(DD(**kwargs))
 
+def remember_group_chat(chat_id: int, title: str = "") -> None:
+    chat_id = int(chat_id or 0)
+    if chat_id >= 0:
+        return
+
+    db_exec(
+        "INSERT INTO known_group_chats (chat_id, title, added_ts, last_seen_ts) VALUES (?,?,?,?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET "
+        "title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE known_group_chats.title END, "
+        "last_seen_ts=excluded.last_seen_ts",
+        (chat_id, str(title or "")[:200], now_ts(), now_ts()),
+        commit=True
+    )
+
+def forget_group_chat(chat_id: int) -> None:
+    db_exec("DELETE FROM known_group_chats WHERE chat_id=?", (int(chat_id),), commit=True)
+
+def get_known_broadcast_group_ids() -> List[int]:
+    """
+    Источники:
+    1) known_group_chats — чаты, где бот уже видел команды/сообщения
+    2) games.origin_chat_id
+    3) transfers.chat_id
+    """
+    out: List[int] = []
+    seen = set()
+
+    queries = [
+        "SELECT chat_id FROM known_group_chats WHERE chat_id < 0 ORDER BY last_seen_ts DESC, added_ts DESC",
+        "SELECT DISTINCT COALESCE(origin_chat_id,0) FROM games WHERE COALESCE(origin_chat_id,0) < 0",
+        "SELECT DISTINCT COALESCE(chat_id,0) FROM transfers WHERE COALESCE(chat_id,0) < 0",
+    ]
+
+    for sql in queries:
+        try:
+            rows = db_all(sql, ())
+        except Exception:
+            rows = []
+
+        for r in rows or []:
+            try:
+                chat_id = int((r[0] if r else 0) or 0)
+            except Exception:
+                chat_id = 0
+
+            if chat_id < 0 and chat_id not in seen:
+                seen.add(chat_id)
+                out.append(chat_id)
+
+    return out
+
+def bot_is_present_in_group(chat_id: int, bot_me_id: int = 0) -> bool:
+    chat_id = int(chat_id or 0)
+    if chat_id >= 0:
+        return False
+
+    try:
+        if int(bot_me_id or 0) <= 0:
+            me = bot.get_me()
+            bot_me_id = int(getattr(me, "id", 0) or 0)
+
+        me_member = bot.get_chat_member(chat_id, int(bot_me_id))
+        me_status = str(getattr(me_member, "status", "") or "")
+
+        if me_status in ("left", "kicked"):
+            forget_group_chat(chat_id)
+            return False
+
+        remember_group_chat(chat_id)
+        return True
+    except Exception:
+        return True
+
 # Moderation helpers
 def parse_duration_to_seconds(token: str) -> Optional[int]:
     """
@@ -1177,6 +1269,95 @@ def report_get_state(uid: int) -> Tuple[Optional[str], Optional[str]]:
 
 def report_clear_state(uid: int) -> None:
     db_exec("DELETE FROM report_state WHERE user_id=?", (int(uid),), commit=True)
+
+def trade_state_set(uid: int, action: str, payload: str = "", stage: str = "ready") -> None:
+    db_exec(
+        "INSERT INTO pm_trade_state (user_id, action, payload, stage, created_ts) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET action=excluded.action, payload=excluded.payload, "
+        "stage=excluded.stage, created_ts=excluded.created_ts",
+        (int(uid), str(action or ""), str(payload or ""), str(stage or "ready"), now_ts()),
+        commit=True
+    )
+
+def trade_state_get(uid: int) -> Tuple[Optional[str], Optional[str], str]:
+    r = db_one(
+        "SELECT action, stage, payload FROM pm_trade_state WHERE user_id=?",
+        (int(uid),)
+    )
+    if not r:
+        return None, None, ""
+    return (r[0], r[1], str(r[2] or ""))
+
+def trade_state_clear(uid: int) -> None:
+    db_exec("DELETE FROM pm_trade_state WHERE user_id=?", (int(uid),), commit=True)
+
+def _trade_pack_payload(target_un: str = "", amount_raw: str = "") -> str:
+    return f"{(target_un or '').strip()}|{(amount_raw or '').strip()}"
+
+def _trade_unpack_payload(payload: str) -> Tuple[str, str]:
+    s = str(payload or "")
+    if "|" in s:
+        a, b = s.split("|", 1)
+        return a.strip(), b.strip()
+    return s.strip(), ""
+
+def _make_private_stub_message(uid: int, username: Optional[str], text: str):
+    class _Obj:
+        pass
+
+    msg = _Obj()
+    chat = _Obj()
+    user = _Obj()
+
+    chat.id = int(uid)
+    chat.type = "private"
+
+    user.id = int(uid)
+    user.username = username
+
+    msg.chat = chat
+    msg.from_user = user
+    msg.text = text
+    msg.message_id = 0
+    msg.reply_to_message = None
+
+    return msg
+
+def _begin_trade_pm_flow(uid: int, username: Optional[str], action: str, payload: str) -> None:
+    action = str(action or "").strip()
+    target_un, amount_raw = _trade_unpack_payload(payload)
+
+    bot.send_message(int(uid), "Продолжаем оформление сделки в личных сообщениях.")
+
+    if action == "buyout":
+        trade_state_clear(uid)
+        cmd_buyout(_make_private_stub_message(uid, username, "/buyout"))
+        return
+
+    if action not in ("buyrab", "rebuy"):
+        trade_state_clear(uid)
+        return
+
+    if not target_un:
+        trade_state_clear(uid)
+        bot.send_message(int(uid), "Заявка устарела. Запустите сделку заново.")
+        return
+
+    if amount_raw:
+        trade_state_clear(uid)
+        if action == "buyrab":
+            cmd_buyrab(_make_private_stub_message(uid, username, f"/buyrab @{target_un} {amount_raw}"))
+        else:
+            cmd_buy(_make_private_stub_message(uid, username, f"/rebuy @{target_un} {amount_raw}"))
+        return
+
+    trade_state_set(uid, action, _trade_pack_payload(target_un, ""), stage="await_amount")
+    bot.send_message(
+        int(uid),
+        f"Укажите цену для сделки с @{html_escape(target_un)}.\n"
+        "Поддерживаемые форматы <code>15000</code> или <code>15000.50</code>",
+        parse_mode="HTML"
+    )
 
 # Credit helpers
 CREDIT_INTERVAL_SEC = 2 * 24 * 3600
@@ -3882,6 +4063,74 @@ def on_mail_open(call: CallbackQuery):
 
     bot.answer_callback_query(call.id)
 
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("dealpm:"))
+def on_dealpm_callbacks(call: CallbackQuery):
+    base, owner = cb_unpack(call.data)
+    uid = call.from_user.id
+
+    if owner is not None and owner != uid:
+        bot.answer_callback_query(call.id, "Вы не можете нажать на эту кнопку", show_alert=True)
+        return
+
+    parts = (base or "").split(":")
+    if len(parts) < 2 or parts[1] != "open":
+        bot.answer_callback_query(call.id)
+        return
+
+    action, _stage, payload = trade_state_get(uid)
+    if not action:
+        bot.answer_callback_query(call.id, "Заявка не найдена или устарела.", show_alert=True)
+        return
+
+    try:
+        _begin_trade_pm_flow(uid, getattr(call.from_user, "username", None), action, payload)
+    except Exception:
+        open_hint = f"@{BOT_USERNAME}" if BOT_USERNAME else "ботом"
+        bot.answer_callback_query(
+            call.id,
+            f"Сначала откройте личные сообщения с {open_hint} и нажмите /start.",
+            show_alert=True
+        )
+        return
+
+    bot.answer_callback_query(call.id, "Проверьте личные сообщения.")
+
+@bot.message_handler(content_types=["new_chat_members"])
+def on_bot_added_to_group(message):
+    if message.chat.type not in ("group", "supergroup"):
+        return
+
+    try:
+        me_id = int(getattr(ME, "id", 0) or 0)
+    except Exception:
+        me_id = 0
+
+    for u in (getattr(message, "new_chat_members", None) or []):
+        try:
+            uid = int(getattr(u, "id", 0) or 0)
+        except Exception:
+            uid = 0
+
+        if me_id > 0 and uid == me_id:
+            remember_group_chat(message.chat.id, getattr(message.chat, "title", "") or "")
+            break
+
+@bot.message_handler(content_types=["left_chat_member"])
+def on_bot_left_group(message):
+    if message.chat.type not in ("group", "supergroup"):
+        return
+
+    try:
+        me_id = int(getattr(ME, "id", 0) or 0)
+    except Exception:
+        me_id = 0
+
+    left_user = getattr(message, "left_chat_member", None)
+    left_id = int(getattr(left_user, "id", 0) or 0) if left_user else 0
+
+    if me_id > 0 and left_id == me_id:
+        forget_group_chat(message.chat.id)
+
 def compute_group_key_from_callback(call: CallbackQuery, prefix_len=PREFIX_LEN) -> Optional[str]:
     if getattr(call, "message", None) and getattr(call.message, "chat", None):
         return f"chat:{call.message.chat.id}"
@@ -4529,6 +4778,35 @@ def on_private_text(message):
     uid = message.from_user.id
     username = getattr(message.from_user, "username", None)
     upsert_user(uid, username)
+
+    t_action, t_stage, t_payload = trade_state_get(uid)
+    if t_action and t_stage == "await_amount":
+        target_un, _old_amount = _trade_unpack_payload(t_payload)
+
+        if not target_un:
+            trade_state_clear(uid)
+            bot.reply_to(message, "Заявка устарела. Запустите сделку заново.")
+            return
+
+        raw_sum = (message.text or "").replace("$", "").strip()
+        cents = money_to_cents(raw_sum)
+        if cents is None or cents <= 0:
+            bot.reply_to(message, "Неверный формат суммы. Поддерживаемые форматы 15000 или 15000.50")
+            return
+
+        trade_state_clear(uid)
+
+        if t_action == "buyrab":
+            cmd_buyrab(_make_private_stub_message(uid, username, f"/buyrab @{target_un} {raw_sum}"))
+            return
+
+        if t_action == "rebuy":
+            cmd_buy(_make_private_stub_message(uid, username, f"/rebuy @{target_un} {raw_sum}"))
+            return
+
+        trade_state_clear(uid)
+        bot.reply_to(message, "Заявка устарела. Запустите сделку заново.")
+        return   
 
     stage, msg_id = get_reg_state(uid)
     if stage != "await_name" or not msg_id:
@@ -8763,6 +9041,8 @@ def apply_demon_life_settlement(game_id: str):
 # DEV COMMANDS
 @bot.message_handler(commands=["devil"])
 def cmd_devil(message):
+    if message.chat.type != "private":
+        return
     if message.from_user.id != OWNER_ID:
         return
     parts = message.text.split()
@@ -8794,6 +9074,9 @@ threading.Thread(target=_mail_daemon, daemon=True).start()
 
 @bot.message_handler(commands=["human"])
 def cmd_human(message):
+    if message.chat.type != "private":
+        return
+
     if message.from_user.id != OWNER_ID:
         return
     parts = message.text.split()
@@ -9131,8 +9414,6 @@ def cmd_delstat(message):
 def cmd_blockcash(message):
     if message.from_user.id != OWNER_ID:
         return
-    if message.chat.type != "private":
-        return
 
     raw = (message.text or "").strip()
     parts = raw.split(maxsplit=2)
@@ -9227,8 +9508,6 @@ def cmd_blockcash(message):
 def cmd_udblockcash(message):
     if message.from_user.id != OWNER_ID:
         return
-    if message.chat.type != "private":
-        return
 
     parts = (message.text or "").split(maxsplit=1)
 
@@ -9298,39 +9577,6 @@ def cmd_udblockcash(message):
     except Exception:
         pass
 
-def get_known_broadcast_group_ids() -> List[int]:
-    """
-    Берём только те группы, чьи chat_id уже известны боту по базе.
-    Источники:
-    - games.origin_chat_id
-    - transfers.chat_id
-    """
-    out: List[int] = []
-    seen = set()
-
-    queries = [
-        "SELECT DISTINCT COALESCE(origin_chat_id,0) FROM games WHERE COALESCE(origin_chat_id,0) < 0",
-        "SELECT DISTINCT COALESCE(chat_id,0) FROM transfers WHERE COALESCE(chat_id,0) < 0",
-    ]
-
-    for sql in queries:
-        try:
-            rows = db_all(sql, ())
-        except Exception:
-            rows = []
-
-        for r in rows or []:
-            try:
-                chat_id = int((r[0] if r else 0) or 0)
-            except Exception:
-                chat_id = 0
-
-            if chat_id < 0 and chat_id not in seen:
-                seen.add(chat_id)
-                out.append(chat_id)
-
-    return out
-
 @bot.message_handler(commands=["remessage"])
 def cmd_remessage(message):
     if message.from_user.id != OWNER_ID:
@@ -9386,8 +9632,6 @@ def cmd_remessage(message):
                     return False
             return False
 
-    covered_uids = set()
-
     group_sent = 0
     group_failed = 0
     group_checked = 0
@@ -9411,155 +9655,12 @@ def cmd_remessage(message):
     for chat_id in group_ids:
         group_checked += 1
 
-        try:
-            if bot_me_id > 0:
-                me_member = bot.get_chat_member(int(chat_id), int(bot_me_id))
-                me_status = str(getattr(me_member, "status", "") or "")
-                if me_status in ("left", "kicked"):
-                    continue
-            else:
-                bot.get_chat(int(chat_id))
-        except Exception:
-            continue
-
-        members_here = []
-
-        for uid in uids:
-            if uid in covered_uids:
-                continue
-            try:
-                mem = bot.get_chat_member(int(chat_id), int(uid))
-                st = str(getattr(mem, "status", "") or "")
-                if st and st not in ("left", "kicked"):
-                    members_here.append(int(uid))
-            except Exception:
-                pass
-            time.sleep(0.02)
-
-        if not members_here:
+        if not bot_is_present_in_group(int(chat_id), bot_me_id=bot_me_id):
             continue
 
         if _send_with_retry(int(chat_id), body):
             group_sent += 1
-            covered_uids.update(members_here)
-        else:
-            group_failed += 1
-
-        time.sleep(0.05)
-
-    sent = 0
-    failed = 0
-
-    for uid in uids:
-        if uid in covered_uids:
-            continue
-
-        if _send_with_retry(int(uid), body):
-            sent += 1
-        else:
-            failed += 1
-
-        time.sleep(0.03)
-
-    bot.reply_to(
-        message,
-        "Рассылка завершена.\n"
-        f"Групповых отправок: {group_sent}\n"
-        f"Ошибок по группам: {group_failed}\n"
-        f"Личных отправок: {sent}\n"
-        f"Ошибок в ЛС: {failed}\n"
-        f"Проверено групп: {group_checked}"
-    )
-def cmd_remessage(message):
-    if message.from_user.id != OWNER_ID:
-        return
-    if message.chat.type != "private":
-        return
-
-    raw = message.text or ""
-    if "\n" not in raw:
-        bot.reply_to(
-            message,
-            "Использование:\n"
-            "/remessage\n"
-            "<текст рассылки с HTML-разметкой>"
-        )
-        return
-
-    _cmd, body = raw.split("\n", 1)
-    body = (body or "").strip("\n")
-    if not body.strip():
-        bot.reply_to(message, "Текст рассылки пуст.")
-        return
-
-    rows = db_all("SELECT user_id FROM users WHERE COALESCE(contract_ts,0) > 0", ())
-    uids = [int(r[0]) for r in (rows or []) if r and str(r[0]).isdigit()]
-
-    if not uids:
-        bot.reply_to(message, "Нет зарегистрированных пользователей для рассылки.")
-        return
-
-    def _parse_retry_after(exc: Exception) -> float:
-        s = str(exc)
-        m = re.search(r"retry after (\d+(?:\.\d+)?)", s, re.IGNORECASE)
-        if m:
-            try:
-                return float(m.group(1))
-            except Exception:
-                return 0.0
-        return 0.0
-
-    def _send_with_retry(chat_id: int, text: str) -> bool:
-        try:
-            bot.send_message(int(chat_id), text, parse_mode="HTML")
-            return True
-        except Exception as e:
-            ra = _parse_retry_after(e)
-            if ra and ra > 0:
-                time.sleep(ra + 0.2)
-                try:
-                    bot.send_message(int(chat_id), text, parse_mode="HTML")
-                    return True
-                except Exception:
-                    return False
-            return False
-
-    group_sent = 0
-    group_failed = 0
-    group_checked = 0
-
-    bot_me_id = 0
-    try:
-        if ME:
-            bot_me_id = int(getattr(ME, "id", 0) or 0)
-    except Exception:
-        bot_me_id = 0
-
-    if bot_me_id <= 0:
-        try:
-            me = bot.get_me()
-            bot_me_id = int(getattr(me, "id", 0) or 0)
-        except Exception:
-            bot_me_id = 0
-
-    group_ids = get_known_broadcast_group_ids()
-
-    for chat_id in group_ids:
-        group_checked += 1
-
-        try:
-            if bot_me_id > 0:
-                me_member = bot.get_chat_member(int(chat_id), int(bot_me_id))
-                me_status = str(getattr(me_member, "status", "") or "")
-                if me_status in ("left", "kicked"):
-                    continue
-            else:
-                bot.get_chat(int(chat_id))
-        except Exception:
-            continue
-
-        if _send_with_retry(int(chat_id), body):
-            group_sent += 1
+            remember_group_chat(int(chat_id))
         else:
             group_failed += 1
 
@@ -9571,7 +9672,8 @@ def cmd_remessage(message):
             "Рассылка завершена.\n"
             f"Групповых отправок: {group_sent}\n"
             f"Ошибок по группам: {group_failed}\n"
-            "Личные сообщения не отправлялись, так как рассылка ушла в групповые чаты."
+            f"Проверено групп: {group_checked}\n"
+            "Личные сообщения не отправлялись."
         )
         return
 
@@ -9589,6 +9691,7 @@ def cmd_remessage(message):
         message,
         "Рассылка завершена.\n"
         f"Групповых отправок: 0\n"
+        f"Ошибок по группам: {group_failed}\n"
         f"Проверено групп: {group_checked}\n"
         f"Личных отправок: {sent}\n"
         f"Ошибок в ЛС: {failed}"
@@ -10319,11 +10422,11 @@ def cmd_pay(message):
 
 @bot.message_handler(commands=["rabs"])
 def cmd_rabs(message):
-    if message.chat.type != "private":
-        return
-
     viewer_id = message.from_user.id
     upsert_user(viewer_id, getattr(message.from_user, "username", None))
+
+    if message.chat.type in ("group", "supergroup"):
+        remember_group_chat(message.chat.id, getattr(message.chat, "title", "") or "")
 
     parts = (message.text or "").split()
     if len(parts) < 2 or not parts[1].startswith("@"):
@@ -10345,12 +10448,69 @@ def cmd_rabs(message):
 
 @bot.message_handler(commands=["buyrab"])
 def cmd_buyrab(message):
-    if message.chat.type != "private":
-        return
-
     buyer_id = message.from_user.id
     buyer_un = getattr(message.from_user, "username", None)
     upsert_user(buyer_id, buyer_un)
+
+    if message.chat.type in ("group", "supergroup"):
+        remember_group_chat(message.chat.id, getattr(message.chat, "title", "") or "")
+
+        parts = (message.text or "").split(maxsplit=2)
+        if len(parts) < 2 or not parts[1].startswith("@"):
+            bot.reply_to(message, "Использование: /buyrab @username [сумма]")
+            return
+
+        target_uname = parts[1][1:].strip()
+        amount_raw = ""
+
+        if len(parts) >= 3 and parts[2].strip():
+            amount_raw = parts[2].replace("$", "").strip()
+            chk = money_to_cents(amount_raw)
+            if chk is None or chk <= 0:
+                bot.reply_to(message, "Неверный формат суммы. Поддерживаемые форматы 15000 или 15000.50")
+                return
+
+        rr = db_one(
+            "SELECT user_id, short_name, username FROM users WHERE username=? COLLATE NOCASE",
+            (target_uname,),
+        )
+        if not rr:
+            bot.reply_to(message, "Пользователь не найден.")
+            return
+
+        slave_id = int(rr[0])
+        actual_un = (rr[2] or target_uname or "").strip()
+
+        if slave_id == buyer_id:
+            bot.reply_to(message, "Насколько не была бы ценна ваша душа, поверьте, вам не хватит средств, чтобы выкупить её.")
+            return
+
+        if not is_slave(slave_id):
+            bot.reply_to(message, "Этот пользователь не является рабом.")
+            return
+
+        if db_one("SELECT 1 FROM slavery WHERE slave_id=? AND owner_id=? LIMIT 1", (slave_id, buyer_id)):
+            bot.reply_to(message, "Вы уже являетесь владельцем этого раба. Для выкупа доли с владения раба используйте /rebuy.")
+            return
+
+        if db_one(
+            "SELECT 1 FROM buyrab_offers WHERE slave_id=? AND buyer_id=? AND state IN (0,1) LIMIT 1",
+            (slave_id, buyer_id),
+        ):
+            bot.reply_to(message, "У вас уже есть активная сделка на этого раба.")
+            return
+
+        trade_state_set(buyer_id, "buyrab", _trade_pack_payload(actual_un, amount_raw), stage="ready")
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("Продолжить", callback_data=cb_pack("dealpm:open", buyer_id)))
+
+        bot.reply_to(
+            message,
+            "Продолжить оформление сделки можно в личных сообщениях бота.",
+            reply_markup=kb
+        )
+        return
 
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 2 or not parts[1].startswith("@"):
@@ -10500,6 +10660,25 @@ def cmd_buyrab(message):
 
 @bot.message_handler(commands=["buyout"])
 def cmd_buyout(message):
+    if message.chat.type in ("group", "supergroup"):
+        remember_group_chat(message.chat.id, getattr(message.chat, "title", "") or "")
+
+        if not is_slave(message.from_user.id):
+            bot.reply_to(message, "Ты не раб.")
+            return
+
+        trade_state_set(message.from_user.id, "buyout", "", stage="ready")
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("Продолжить", callback_data=cb_pack("dealpm:open", message.from_user.id)))
+
+        bot.reply_to(
+            message,
+            "Продолжить оформление выкупа можно в личных сообщениях бота.",
+            reply_markup=kb
+        )
+        return
+
     if message.chat.type != "private":
         return
 
@@ -10562,9 +10741,66 @@ def cmd_buyout(message):
 
 @bot.message_handler(commands=["rebuy"])
 def cmd_buy(message):
-    if message.chat.type != "private":
+    if message.chat.type in ("group", "supergroup"):
+        remember_group_chat(message.chat.id, getattr(message.chat, "title", "") or "")
+
+        buyer_id = message.from_user.id
+        buyer_username = getattr(message.from_user, "username", None)
+        upsert_user(buyer_id, buyer_username)
+
+        parts = (message.text or "").split(maxsplit=2)
+        if len(parts) < 2 or not parts[1].startswith("@"):
+            bot.reply_to(message, "Использование: /rebuy @username [цена]")
+            return
+
+        slave_un = parts[1][1:].strip()
+        amount_raw = ""
+
+        if len(parts) >= 3 and parts[2].strip():
+            amount_raw = parts[2].replace("$", "").strip()
+            chk = money_to_cents(amount_raw)
+            if chk is None or chk <= 0:
+                bot.reply_to(message, "Неверная цена.")
+                return
+
+        rr = db_one(
+            "SELECT user_id, username FROM users WHERE username=? COLLATE NOCASE",
+            (slave_un,)
+        )
+        if not rr:
+            bot.reply_to(message, "Пользователь не найден в базе.")
+            return
+
+        slave_id = int(rr[0])
+        actual_un = (rr[1] or slave_un or "").strip()
+
+        if db_one("SELECT 1 FROM slavery WHERE slave_id=? AND owner_id=? LIMIT 1", (slave_id, buyer_id)) is None:
+            bot.reply_to(message, "Ты не являешься владельцем этого раба.")
+            return
+
+        other_owners = db_all(
+            "SELECT owner_id FROM slavery WHERE slave_id=? AND owner_id<>?",
+            (slave_id, buyer_id)
+        )
+        if not other_owners:
+            bot.reply_to(message, "Ты уже единственный владелец.")
+            return
+
+        trade_state_set(buyer_id, "rebuy", _trade_pack_payload(actual_un, amount_raw), stage="ready")
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("Продолжить", callback_data=cb_pack("dealpm:open", buyer_id)))
+
+        bot.reply_to(
+            message,
+            "Продолжить оформление сделки можно в личных сообщениях бота.",
+            reply_markup=kb
+        )
         return
 
+    if message.chat.type != "private":
+        return
+    
     buyer_id = message.from_user.id
     buyer_username = getattr(message.from_user, "username", None)
     upsert_user(buyer_id, buyer_username)
