@@ -9679,6 +9679,8 @@ def cmd_remessage(message):
     group_failed = 0
     group_checked = 0
 
+    covered_uids = set()
+
     bot_me_id = 0
     try:
         if ME:
@@ -9701,11 +9703,28 @@ def cmd_remessage(message):
         if not bot_is_present_in_group(int(chat_id), bot_me_id=bot_me_id):
             continue
 
-        if _send_with_retry(int(chat_id), body):
+        sent_to_group = _send_with_retry(int(chat_id), body)
+        if sent_to_group:
             group_sent += 1
             remember_group_chat(int(chat_id))
         else:
             group_failed += 1
+            time.sleep(0.05)
+            continue
+
+        for uid in uids:
+            if uid in covered_uids:
+                continue
+
+            try:
+                mem = bot.get_chat_member(int(chat_id), int(uid))
+                st = str(getattr(mem, "status", "") or "")
+                if st and st not in ("left", "kicked"):
+                    covered_uids.add(int(uid))
+            except Exception:
+                pass
+
+            time.sleep(0.02)
 
         time.sleep(0.05)
 
@@ -9713,10 +9732,14 @@ def cmd_remessage(message):
     failed = 0
 
     for uid in uids:
+        if uid in covered_uids:
+            continue
+
         if _send_with_retry(int(uid), body):
             sent += 1
         else:
             failed += 1
+
         time.sleep(0.03)
 
     bot.reply_to(
@@ -9725,6 +9748,7 @@ def cmd_remessage(message):
         f"Групповых отправок: {group_sent}\n"
         f"Ошибок по группам: {group_failed}\n"
         f"Проверено групп: {group_checked}\n"
+        f"Покрыто через группы: {len(covered_uids)}\n"
         f"Личных отправок: {sent}\n"
         f"Ошибок в ЛС: {failed}"
     )
